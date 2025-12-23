@@ -1,0 +1,25 @@
+{
+  "audio_settings": {
+    "sample_rate": 22050,
+    "min_freq": 32.7,
+    "max_freq": 4186.01,
+    "tempo": 120
+  },
+  "detection_settings": {
+    "silence_threshold_db": 40,
+    "confidence_threshold": 0.7,
+    "min_clip_duration": 0.05
+  },
+  "processing_settings": {
+    "time_stretch_range": [
+      0.5,
+      2.0
+    ],
+    "pitch_shift_range": [
+      -12,
+      12
+    ],
+    "fade_in": 0.01,
+    "fade_out": 0.01
+  }
+}
