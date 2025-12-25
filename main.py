@@ -102,6 +102,46 @@ config = AppConfig()
 os.makedirs(config.clip_dir, exist_ok=True)
 os.makedirs(config.output_dir, exist_ok=True)
 
+# ========= 音频处理工具函数 =========
+
+_clip_index_cache = None  # 缓存索引，避免每次重建
+
+def build_clip_index():
+    """
+    构建音频片段的音高索引，加速查找。
+    返回结构: {rounded_midi: [(clip_info, original_midi, confidence), ...]}
+    """
+    global _clip_index_cache
+    if _clip_index_cache is not None:
+        return _clip_index_cache
+    
+    index = {}
+    available_clips = clip_manager.get_all_clips()
+    
+    for clip in available_clips:
+        note_info = clip.get('note_info', {})
+        if note_info and note_info.get('frequency') and note_info.get('confidence'):
+            clip_freq = note_info['frequency']
+            clip_midi = freq_to_midi(clip_freq)  # 精确的浮点数MIDI
+            confidence = note_info.get('confidence', 0.5)
+            
+            # 将MIDI音高四舍五入到最接近的整数，作为索引键
+            rounded_midi = int(round(clip_midi))
+            
+            if rounded_midi not in index:
+                index[rounded_midi] = []
+            
+            index[rounded_midi].append({
+                'clip': clip,
+                'exact_midi': clip_midi,     # 保存精确值用于计算
+                'confidence': confidence,
+                # 可以在这里扩展存储 instrument_tag 等元数据
+            })
+    
+    _clip_index_cache = index
+    print(f"[索引构建完成] 共 {len(available_clips)} 个片段，索引到 {len(index)} 个不同音高。")
+    return index
+
 # ========= 乐理工具函数 =========
 
 def note_to_midi(note: str) -> Optional[int]:
@@ -599,7 +639,7 @@ class AudioClipManager:
         
         self.clips.append(clip_info)
         self.save_clips()
-        
+        clear_clip_index_cache()
         return clip_info
     
     def get_clip_by_note(self, target_note: str, tolerance_cents: float = 50) -> List[Dict]:
@@ -647,6 +687,7 @@ class AudioClipManager:
                 c['id'] = i
             
             self.save_clips()
+            clear_clip_index_cache()
             return True
         return False
     
@@ -680,6 +721,7 @@ class AudioClipManager:
         
         self.clips = []
         self.save_clips()
+        clear_clip_index_cache()
         return deleted_files
 
 # ========= Gradio界面函数 =========
@@ -930,9 +972,9 @@ def build_music_composition_tab():
                     
                     with gr.TabItem("🎵 音符匹配详情"):
                         notes_match_table = gr.Dataframe(
-                            headers=["音符", "目标音高", "匹配片段", "变调(半音)", "状态"],
+                            headers=["序号", "音名", "匹配片段", "变调(半音)", "状态", "音轨", "乐器"],
                             label="音符匹配情况",
-                            datatype=["str", "str", "str", "str", "str"],
+                            datatype=["str", "str", "str", "str", "str", "str", "str"],
                             row_count=10,
                             interactive=False
                         )
@@ -986,25 +1028,31 @@ def build_music_composition_tab():
 
 # ========= 核心音乐生成函数 =========
 
+# ========= 核心音乐生成函数 =========
+
 def parse_score_notes(filepath: str) -> List[Dict]:
     """
-    解析乐谱文件，提取音符信息
-    支持 MusicXML 和 MIDI 格式
+    专业解析乐谱文件，提取音符信息
+    支持 MusicXML 和 MIDI 格式，MIDI解析现在支持完整音符追踪、多音轨、休止符检测
     """
     notes = []
     
     if not filepath or not os.path.exists(filepath):
+        print(f"文件不存在或路径错误: {filepath}")
         return notes
     
     file_ext = os.path.splitext(filepath)[1].lower()
     
     try:
         if file_ext in ['.xml', '.musicxml']:
+            # ============ MusicXML 解析部分 ============
             # 尝试使用 partitura 解析（更专业）
             try:
                 import partitura as pt
                 score = pt.load_score(filepath)
-                for note in score.notes:
+                print(f"使用 partitura 解析 XML，共找到 {len(score.notes)} 个音符")
+                
+                for i, note in enumerate(score.notes):
                     notes.append({
                         'midi_pitch': int(note.midi_pitch),
                         'note_name': note.step + str(note.octave),
@@ -1013,13 +1061,23 @@ def parse_score_notes(filepath: str) -> List[Dict]:
                         'velocity': int(note.velocity) if hasattr(note, 'velocity') else 64,
                         'matched': False,
                         'clip_id': None,
-                        'pitch_shift': 0
+                        'pitch_shift': 0,
+                        'track': 0,  # XML通常不分轨
+                        'instrument': 'piano',  # 默认
+                        'source': 'xml'
                     })
+                    
             except ImportError:
+                print("未安装 partitura，使用 music21 解析 XML")
                 # 回退到 music21
                 import music21 as m21
                 score = m21.converter.parse(filepath)
-                for element in score.flat.notesAndRests:
+                
+                # 获取所有音符
+                all_notes = list(score.flat.notesAndRests)
+                print(f"使用 music21 解析 XML，共找到 {len(all_notes)} 个音符/休止符")
+                
+                for element in all_notes:
                     if isinstance(element, m21.note.Note):
                         notes.append({
                             'midi_pitch': element.pitch.midi,
@@ -1029,80 +1087,388 @@ def parse_score_notes(filepath: str) -> List[Dict]:
                             'velocity': 64,
                             'matched': False,
                             'clip_id': None,
-                            'pitch_shift': 0
+                            'pitch_shift': 0,
+                            'track': 0,
+                            'instrument': 'piano',
+                            'source': 'xml'
+                        })
+                    elif isinstance(element, m21.note.Rest):
+                        # 将休止符记录为特殊音符，midi_pitch为-1
+                        notes.append({
+                            'midi_pitch': -1,  # 休止符标识
+                            'note_name': 'REST',
+                            'duration': float(element.duration.quarterLength),
+                            'start_time': float(element.offset),
+                            'velocity': 0,
+                            'matched': False,
+                            'clip_id': None,
+                            'pitch_shift': 0,
+                            'track': 0,
+                            'instrument': 'rest',
+                            'source': 'xml'
                         })
         
         elif file_ext in ['.mid', '.midi']:
-            # 解析 MIDI 文件
+            # ============ 专业MIDI解析部分 ============
             import mido
+            
+            print(f"开始解析 MIDI 文件: {os.path.basename(filepath)}")
             midi = mido.MidiFile(filepath)
             
-            # 简化的 MIDI 解析（实际需要更复杂的音轨处理）
-            current_time = 0
-            for track in midi.tracks:
+            # 获取MIDI文件的基本信息
+            ticks_per_beat = midi.ticks_per_beat
+            print(f"MIDI基本信息 - 音轨数: {len(midi.tracks)}, 每拍Tick数: {ticks_per_beat}, 类型: {midi.type}")
+            
+            # 存储各音轨的当前时间和活动音符
+            track_info = []
+            for i in range(len(midi.tracks)):
+                track_info.append({
+                    'current_time': 0,  # 当前绝对时间（tick）
+                    'active_notes': {},  # 正在播放的音符: {note_number: start_tick}
+                    'tempo': 500000,  # 默认tempo (120 BPM)
+                    'time_signature': (4, 4),  # 默认拍号
+                    'key_signature': 'C',  # 默认调号
+                    'program': 0,  # 默认乐器 (Acoustic Grand Piano)
+                })
+            
+            # 第一遍：收集所有音符开始和结束事件
+            note_events = []  # (absolute_tick, track_index, note_number, velocity, event_type)
+            
+            for track_idx, track in enumerate(midi.tracks):
+                current_tick = 0
+                
+                print(f"  解析音轨 {track_idx}: {track.name if track.name else '未命名'}, 消息数: {len(track)}")
+                
                 for msg in track:
-                    current_time += msg.time
-                    if msg.type == 'note_on' and msg.velocity > 0:
+                    current_tick += msg.time
+                    
+                    if msg.type == 'note_on':
+                        if msg.velocity > 0:
+                            # 音符开始
+                            note_events.append((current_tick, track_idx, msg.note, msg.velocity, 'start'))
+                        else:
+                            # velocity=0 的 note_on 等价于 note_off
+                            note_events.append((current_tick, track_idx, msg.note, 0, 'end'))
+                    
+                    elif msg.type == 'note_off':
+                        # 音符结束
+                        note_events.append((current_tick, track_idx, msg.note, 0, 'end'))
+                    
+                    elif msg.type == 'set_tempo':
+                        # 记录速度变化 (微秒每拍)
+                        track_info[track_idx]['tempo'] = msg.tempo
+                    
+                    elif msg.type == 'time_signature':
+                        # 记录拍号变化
+                        track_info[track_idx]['time_signature'] = (msg.numerator, msg.denominator)
+                    
+                    elif msg.type == 'key_signature':
+                        # 记录调号变化
+                        track_info[track_idx]['key_signature'] = msg.key
+                    
+                    elif msg.type == 'program_change':
+                        # 记录乐器变化
+                        track_info[track_idx]['program'] = msg.program
+            
+            # 按时间排序所有事件
+            note_events.sort(key=lambda x: x[0])
+            
+            # 第二遍：匹配音符的开始和结束，计算时长
+            active_notes_map = {}  # (track_idx, note_number) -> start_tick
+            
+            for event in note_events:
+                abs_tick, track_idx, note_num, velocity, event_type = event
+                key = (track_idx, note_num)
+                
+                if event_type == 'start':
+                    # 记录音符开始
+                    active_notes_map[key] = {
+                        'start_tick': abs_tick,
+                        'velocity': velocity,
+                        'track_idx': track_idx
+                    }
+                elif event_type == 'end' and key in active_notes_map:
+                    # 找到匹配的音符结束，计算时长
+                    start_info = active_notes_map.pop(key)
+                    duration_ticks = abs_tick - start_info['start_tick']
+                    
+                    if duration_ticks > 0:  # 过滤掉时长为0的音符
+                        # 将tick转换为拍数 (beats)
+                        duration_beats = duration_ticks / ticks_per_beat
+                        start_beats = start_info['start_tick'] / ticks_per_beat
+                        
+                        # 获取当前音轨信息
+                        track_data = track_info[track_idx]
+                        
+                        # 计算BPM
+                        bpm = 60_000_000 / track_data['tempo']  # 微秒转BPM
+                        
+                        # 根据乐器program获取乐器名称
+                        instrument_name = get_instrument_name(track_data['program'])
+                        
                         notes.append({
-                            'midi_pitch': msg.note,
-                            'note_name': midi_to_note(msg.note),
-                            'duration': 1.0,  # MIDI需要更复杂的时长计算
-                            'start_time': current_time / 480,  # 假设480 ticks per beat
-                            'velocity': msg.velocity,
+                            'midi_pitch': note_num,
+                            'note_name': midi_to_note(note_num),
+                            'duration': float(duration_beats),
+                            'start_time': float(start_beats),
+                            'velocity': start_info['velocity'],
                             'matched': False,
                             'clip_id': None,
-                            'pitch_shift': 0
+                            'pitch_shift': 0,
+                            'track': track_idx,
+                            'instrument': instrument_name,
+                            'program': track_data['program'],
+                            'tempo': bpm,
+                            'time_signature': track_data['time_signature'],
+                            'key_signature': track_data['key_signature'],
+                            'source': 'midi'
                         })
+            
+            # 处理未结束的音符（如果MIDI文件没有相应的note_off）
+            for key, start_info in active_notes_map.items():
+                track_idx, note_num = key
+                # 假设音符持续到文件末尾或给一个默认时长
+                final_tick = max([event[0] for event in note_events]) if note_events else 0
+                duration_ticks = final_tick - start_info['start_tick']
+                
+                if duration_ticks > 0:
+                    duration_beats = duration_ticks / ticks_per_beat
+                    start_beats = start_info['start_tick'] / ticks_per_beat
+                    
+                    track_data = track_info[track_idx]
+                    instrument_name = get_instrument_name(track_data['program'])
+                    
+                    notes.append({
+                        'midi_pitch': note_num,
+                        'note_name': midi_to_note(note_num),
+                        'duration': float(duration_beats),
+                        'start_time': float(start_beats),
+                        'velocity': start_info['velocity'],
+                        'matched': False,
+                        'clip_id': None,
+                        'pitch_shift': 0,
+                        'track': track_idx,
+                        'instrument': instrument_name,
+                        'program': track_data['program'],
+                        'tempo': 60_000_000 / track_data['tempo'],
+                        'time_signature': track_data['time_signature'],
+                        'key_signature': track_data['key_signature'],
+                        'source': 'midi'
+                    })
+            
+            print(f"MIDI解析完成，共提取 {len(notes)} 个音符")
+            
+            # 检测并添加休止符
+            notes = add_rests_to_midi(notes)
     
     except Exception as e:
-        print(f"解析乐谱失败 {filepath}: {e}")
-        # 返回示例数据用于测试
+        print(f"解析乐谱失败 {filepath}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        # 返回示例数据用于测试（仅当完全失败时）
         notes = [
-            {'midi_pitch': 60, 'note_name': 'C4', 'duration': 1.0, 'start_time': 0.0, 'velocity': 64, 'matched': False, 'clip_id': None, 'pitch_shift': 0},
-            {'midi_pitch': 62, 'note_name': 'D4', 'duration': 1.0, 'start_time': 1.0, 'velocity': 64, 'matched': False, 'clip_id': None, 'pitch_shift': 0},
-            {'midi_pitch': 64, 'note_name': 'E4', 'duration': 2.0, 'start_time': 2.0, 'velocity': 64, 'matched': False, 'clip_id': None, 'pitch_shift': 0},
+            {'midi_pitch': 60, 'note_name': 'C4', 'duration': 1.0, 'start_time': 0.0, 
+             'velocity': 64, 'matched': False, 'clip_id': None, 'pitch_shift': 0,
+             'track': 0, 'instrument': 'piano', 'source': 'fallback'},
+            {'midi_pitch': 62, 'note_name': 'D4', 'duration': 1.0, 'start_time': 1.0, 
+             'velocity': 64, 'matched': False, 'clip_id': None, 'pitch_shift': 0,
+             'track': 0, 'instrument': 'piano', 'source': 'fallback'},
+            {'midi_pitch': 64, 'note_name': 'E4', 'duration': 2.0, 'start_time': 2.0, 
+             'velocity': 64, 'matched': False, 'clip_id': None, 'pitch_shift': 0,
+             'track': 0, 'instrument': 'piano', 'source': 'fallback'},
         ]
     
     # 按开始时间排序
     notes.sort(key=lambda x: x['start_time'])
+    
+    # 打印统计信息
+    if notes:
+        print(f"解析统计: 共 {len(notes)} 个音符")
+        print(f"音高范围: {min(n['midi_pitch'] for n in notes if n['midi_pitch'] > 0)} 到 {max(n['midi_pitch'] for n in notes)}")
+        print(f"时间范围: {notes[0]['start_time']:.2f} 到 {notes[-1]['start_time'] + notes[-1]['duration']:.2f} 拍")
+        
+        # 按音轨统计
+        if any(n['track'] > 0 for n in notes):
+            tracks = set(n['track'] for n in notes)
+            print(f"音轨数: {len(tracks)}")
+    
     return notes
 
-def find_best_match_for_note(target_midi: int, tolerance_cents: float = 50.0) -> Tuple[Optional[Dict], float]:
+def get_instrument_name(program: int) -> str:
+    """根据MIDI程序号获取乐器名称"""
+    # GM (General MIDI) 乐器列表 (0-127)
+    gm_instruments = [
+        "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano", 
+        "Honky-tonk Piano", "Electric Piano 1", "Electric Piano 2", "Harpsichord", 
+        "Clavinet", "Celesta", "Glockenspiel", "Music Box", "Vibraphone", 
+        "Marimba", "Xylophone", "Tubular Bells", "Dulcimer", "Drawbar Organ", 
+        "Percussive Organ", "Rock Organ", "Church Organ", "Reed Organ", 
+        "Accordion", "Harmonica", "Tango Accordion", "Acoustic Guitar (nylon)", 
+        "Acoustic Guitar (steel)", "Electric Guitar (jazz)", "Electric Guitar (clean)", 
+        "Electric Guitar (muted)", "Overdriven Guitar", "Distortion Guitar", 
+        "Guitar harmonics", "Acoustic Bass", "Electric Bass (finger)", 
+        "Electric Bass (pick)", "Fretless Bass", "Slap Bass 1", "Slap Bass 2", 
+        "Synth Bass 1", "Synth Bass 2", "Violin", "Viola", "Cello", "Contrabass", 
+        "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani", 
+        "String Ensemble 1", "String Ensemble 2", "Synth Strings 1", "Synth Strings 2", 
+        "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit", "Trumpet", 
+        "Trombone", "Tuba", "Muted Trumpet", "French Horn", "Brass Section", 
+        "Synth Brass 1", "Synth Brass 2", "Soprano Sax", "Alto Sax", "Tenor Sax", 
+        "Baritone Sax", "Oboe", "English Horn", "Bassoon", "Clarinet", "Piccolo", 
+        "Flute", "Recorder", "Pan Flute", "Blown Bottle", "Shakuhachi", "Whistle", 
+        "Ocarina", "Lead 1 (square)", "Lead 2 (sawtooth)", "Lead 3 (calliope)", 
+        "Lead 4 (chiff)", "Lead 5 (charang)", "Lead 6 (voice)", "Lead 7 (fifths)", 
+        "Lead 8 (bass + lead)", "Pad 1 (new age)", "Pad 2 (warm)", "Pad 3 (polysynth)", 
+        "Pad 4 (choir)", "Pad 5 (bowed)", "Pad 6 (metallic)", "Pad 7 (halo)", 
+        "Pad 8 (sweep)", "FX 1 (rain)", "FX 2 (soundtrack)", "FX 3 (crystal)", 
+        "FX 4 (atmosphere)", "FX 5 (brightness)", "FX 6 (goblins)", "FX 7 (echoes)", 
+        "FX 8 (sci-fi)", "Sitar", "Banjo", "Shamisen", "Koto", "Kalimba", 
+        "Bag pipe", "Fiddle", "Shanai", "Tinkle Bell", "Agogo", "Steel Drums", 
+        "Woodblock", "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal", 
+        "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet", 
+        "Telephone Ring", "Helicopter", "Applause", "Gunshot"
+    ]
+    
+    if 0 <= program < 128:
+        return gm_instruments[program]
+    return f"Unknown ({program})"
+
+def add_rests_to_midi(notes: List[Dict]) -> List[Dict]:
+    """在MIDI音符之间检测并添加休止符"""
+    if not notes:
+        return notes
+    
+    notes_with_rests = []
+    notes.sort(key=lambda x: (x['track'], x['start_time']))
+    
+    # 按音轨分组处理
+    tracks = {}
+    for note in notes:
+        track_num = note['track']
+        if track_num not in tracks:
+            tracks[track_num] = []
+        tracks[track_num].append(note)
+    
+    # 为每个音轨添加休止符
+    for track_num, track_notes in tracks.items():
+        track_notes.sort(key=lambda x: x['start_time'])
+        
+        current_time = 0.0
+        
+        for note in track_notes:
+            # 如果当前时间和音符开始时间有间隔，添加休止符
+            if note['start_time'] > current_time:
+                rest_duration = note['start_time'] - current_time
+                
+                notes_with_rests.append({
+                    'midi_pitch': -1,  # 休止符标识
+                    'note_name': 'REST',
+                    'duration': float(rest_duration),
+                    'start_time': float(current_time),
+                    'velocity': 0,
+                    'matched': False,
+                    'clip_id': None,
+                    'pitch_shift': 0,
+                    'track': track_num,
+                    'instrument': 'rest',
+                    'program': -1,
+                    'tempo': note.get('tempo', 120),
+                    'time_signature': note.get('time_signature', (4, 4)),
+                    'key_signature': note.get('key_signature', 'C'),
+                    'source': 'midi_rest'
+                })
+            
+            notes_with_rests.append(note)
+            current_time = note['start_time'] + note['duration']
+    
+    # 重新按时间排序
+    notes_with_rests.sort(key=lambda x: x['start_time'])
+    return notes_with_rests
+
+
+def find_best_match_for_note(target_midi: int, tolerance_cents: float = 50.0, 
+                           use_confidence_weight: bool = True) -> Tuple[Optional[Dict], float]:
     """
-    为目标音符寻找最佳匹配的音频片段
-    返回：(最佳片段信息, 需要变调的半音数)
+    为目标音符寻找最佳匹配的音频片段（优化版）。
+    
+    参数:
+        target_midi: 目标MIDI音高 (整数，如 60 代表 C4)
+        tolerance_cents: 音高容差 (音分)
+        use_confidence_weight: 是否使用置信度作为权重
+    
+    返回:
+        (最佳片段信息, 需要变调的半音数)
     """
+    # 1. 获取或构建索引
+    index = build_clip_index()
+    if not index:
+        return None, 0.0  # 无可用片段
+    
     best_clip = None
-    best_semitones = 0
-    best_distance = float('inf')
+    best_semitones = 0.0
+    best_score = -float('inf')  # 使用评分系统，分数越高越好
     
-    available_clips = clip_manager.get_all_clips()
+    # 2. 确定搜索范围：目标音高附近 ± (容差/100 + 1) 个半音
+    search_semitones = int(tolerance_cents / 100) + 2
+    lower_bound = target_midi - search_semitones
+    upper_bound = target_midi + search_semitones
     
-    for clip in available_clips:
-        note_info = clip.get('note_info', {})
-        if note_info and note_info.get('frequency'):
-            # 计算片段的MIDI音高
-            clip_freq = note_info['frequency']
-            clip_midi = freq_to_midi(clip_freq)
+    # 3. 在索引的邻近键中搜索
+    for search_midi in range(lower_bound, upper_bound + 1):
+        if search_midi not in index:
+            continue
+        
+        for clip_data in index[search_midi]:
+            clip = clip_data['clip']
+            clip_exact_midi = clip_data['exact_midi']
+            confidence = clip_data['confidence']
             
-            # 计算音高差异（半音）
-            semitones_diff = target_midi - clip_midi
+            # 计算精确的音高差异（半音）
+            semitones_diff = target_midi - clip_exact_midi
+            cents_diff = semitones_diff * 100.0
             
-            # 转换为音分差异
-            cents_diff = semitones_diff * 100
-            
-            # 如果在容差范围内，直接使用
+            # 如果在绝对容差范围内，才考虑
             if abs(cents_diff) <= tolerance_cents:
-                return clip, semitones_diff
-            
-            # 否则记录最接近的片段
-            distance = abs(cents_diff)
-            if distance < best_distance:
-                best_distance = distance
-                best_clip = clip
-                best_semitones = semitones_diff
+                # 计算匹配分数：音分越接近、置信度越高，分数越高
+                closeness_score = 1.0 - (abs(cents_diff) / tolerance_cents)  # 0到1
+                confidence_score = confidence if use_confidence_weight else 1.0
+                
+                # 综合分数 (可以调整权重)
+                total_score = (closeness_score * 0.7) + (confidence_score * 0.3)
+                
+                if total_score > best_score:
+                    best_score = total_score
+                    best_clip = clip
+                    best_semitones = semitones_diff
+    
+    # 4. 如果未找到容差内的，返回最接近的（原逻辑的降级方案）
+    if best_clip is None:
+        # 这里可以保留你原有的线性搜索逻辑作为fallback，但使用索引通常能找到
+        print(f"[匹配警告] 未在容差 {tolerance_cents} 音分内找到 MIDI {target_midi} 的匹配，返回最接近的。")
+        # 简单实现：遍历所有片段找最接近的
+        available_clips = clip_manager.get_all_clips()
+        best_distance = float('inf')
+        for clip in available_clips:
+            note_info = clip.get('note_info', {})
+            if note_info and note_info.get('frequency'):
+                clip_freq = note_info['frequency']
+                clip_midi = freq_to_midi(clip_freq)
+                semitones_diff = target_midi - clip_midi
+                cents_diff = abs(semitones_diff * 100)
+                if cents_diff < best_distance:
+                    best_distance = cents_diff
+                    best_clip = clip
+                    best_semitones = semitones_diff
     
     return best_clip, best_semitones
+
+# 可选：当clip_manager的片段列表更新时，清除缓存以重建索引
+def clear_clip_index_cache():
+    """当添加或删除音频片段后，调用此函数清除索引缓存"""
+    global _clip_index_cache
+    _clip_index_cache = None
+    print("音频片段索引缓存已清除，将在下次匹配时重建。")
 
 def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, use_pitch_shift=True):
     """
@@ -1132,7 +1498,22 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         for i, note in enumerate(notes):
             target_midi = note['midi_pitch']
             
-            # 寻找最佳匹配
+            # >>> 修改点1：优先处理休止符 <<<
+            if target_midi == -1:
+                note['matched'] = True
+                note['is_rest'] = True
+                match_details.append([
+                    f"音符{i+1}",
+                    note['note_name'],
+                    f"休止符 ({note['duration']:.2f}拍)",
+                    "N/A",
+                    "⏸️ 休止",
+                    note.get('track', 0),  # 展示音轨信息
+                    note.get('instrument', 'rest')
+                ])
+                continue  # 跳过后续匹配逻辑
+            
+            # 寻找最佳匹配（仅针对普通音符）
             best_clip, semitones_diff = find_best_match_for_note(target_midi, tolerance_cents)
             
             if best_clip:
@@ -1147,7 +1528,9 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
                     note['note_name'],
                     f"片段{best_clip['id']} ({best_clip.get('note_info', {}).get('note', '未知')})",
                     f"{semitones_diff:+.1f}" if use_pitch_shift else "0",
-                    match_status
+                    match_status,
+                    note.get('track', 0),  # 新增：展示音轨信息
+                    note.get('instrument', 'unknown')  # 新增：展示乐器信息
                 ])
             else:
                 note['matched'] = False
@@ -1156,14 +1539,18 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
                     note['note_name'],
                     "无可用片段",
                     "N/A",
-                    "❌ 未匹配"
+                    "❌ 未匹配",
+                    note.get('track', 0),
+                    note.get('instrument', 'unknown')
                 ])
         
-        # 统计匹配结果
-        matched_count = sum(1 for n in notes if n['matched'])
-        match_rate = matched_count / len(notes) * 100
+        # 统计匹配结果（仅统计普通音符，排除休止符）
+        valid_notes = [n for n in notes if n.get('midi_pitch', 0) != -1]
+        matched_count = sum(1 for n in valid_notes if n['matched'])
+        total_valid_notes = len(valid_notes)
+        match_rate = matched_count / total_valid_notes * 100 if total_valid_notes > 0 else 0
         
-        generation_status = f"✅ 匹配完成: {matched_count}/{len(notes)} 个音符 ({match_rate:.1f}%)\n🔄 开始处理音频..."
+        generation_status = f"✅ 匹配完成: {matched_count}/{total_valid_notes} 个可匹配音符 ({match_rate:.1f}%)\n🔄 开始处理音频..."
         yield None, generation_status, match_details, "处理中..."
         
         # 3. 处理音频片段
@@ -1171,13 +1558,22 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         audio_segments = []
         
         for i, note in enumerate(notes):
-            if not note['matched']:
-                # 跳过未匹配的音符（或生成静音/默认音）
+            # >>> 修改点2：优先处理休止符 <<<
+            if note.get('is_rest') or note['midi_pitch'] == -1:
+                # 生成静音片段
                 silence_duration = note['duration'] * beat_duration
                 silence_samples = int(silence_duration * sr)
                 audio_segments.append((note['start_time'], np.zeros(silence_samples, dtype=np.float32)))
                 continue
             
+            # 处理未匹配的普通音符（生成静音）
+            if not note['matched']:
+                silence_duration = note['duration'] * beat_duration
+                silence_samples = int(silence_duration * sr)
+                audio_segments.append((note['start_time'], np.zeros(silence_samples, dtype=np.float32)))
+                continue
+            
+            # 处理已匹配的普通音符
             clip_id = note['clip_id']
             semitones = note['pitch_shift']
             
@@ -1227,26 +1623,74 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
             y_processed = apply_fade(y_processed, sr, fade_in=0.02, fade_out=0.05)
             
             audio_segments.append((note['start_time'], y_processed))
+            
+            # 每处理10个片段更新一次状态
+            if i % 10 == 0 and i > 0:
+                processed_count = len([n for n in notes[:i+1] if not n.get('is_rest') and n['midi_pitch'] != -1])
+                generation_status = f"✅ 已处理 {processed_count}/{total_valid_notes} 个音符\n🔄 继续处理音频..."
+                yield None, generation_status, match_details, "处理中..."
         
-        generation_status = f"✅ 音频处理完成\n🔄 开始拼接音乐..."
+        generation_status = f"✅ 音频处理完成，共 {len(audio_segments)} 个音频片段\n🔄 开始拼接音乐..."
         yield None, generation_status, match_details, "拼接中..."
         
-        # 4. 拼接所有音频片段
-        # 计算总时长
-        max_end_time = max(start + len(y)/sr for start, y in audio_segments)
-        total_samples = int(max_end_time * sr) + int(1.0 * sr)  # 加1秒余量
+        # 4. 拼接所有音频片段 - 关键修复部分
+        # 计算总时长（以秒为单位）
+        max_end_time_seconds = 0
+        generation_status = f"🔄 正在计算总时长..."
+        yield None, generation_status, match_details, "计算时长中..."
+        
+        for start_time, segment in audio_segments:
+            segment_duration = len(segment) / sr
+            end_time_seconds = start_time * beat_duration + segment_duration
+            if end_time_seconds > max_end_time_seconds:
+                max_end_time_seconds = end_time_seconds
+        
+        generation_status = f"✅ 总时长计算完成: {max_end_time_seconds:.2f}秒\n🔄 正在分配内存..."
+        yield None, generation_status, match_details, "分配内存中..."
+        
+        # 确保有足够的空间，加上0.5秒的余量
+        total_samples = int(max_end_time_seconds * sr) + int(0.5 * sr)
         final_audio = np.zeros(total_samples, dtype=np.float32)
         
+        generation_status = f"✅ 内存分配完成: {total_samples}个样本\n🔄 开始放置音频片段..."
+        yield None, generation_status, match_details, "放置片段中..."
+        
         # 按时间线放置音频片段
-        for start_time, segment in audio_segments:
+        placed_count = 0
+        for i, (start_time, segment) in enumerate(audio_segments):
             start_sample = int(start_time * beat_duration * sr)
             end_sample = start_sample + len(segment)
             
-            if end_sample <= len(final_audio):
-                final_audio[start_sample:end_sample] += segment
+            # 确保片段在范围内
+            if start_sample < len(final_audio):
+                # 计算实际结束位置
+                end_actual = min(end_sample, len(final_audio))
+                # 确保段长度正确
+                segment_len = end_actual - start_sample
+                if segment_len > 0:
+                    # 使用叠加而不是覆盖
+                    final_audio[start_sample:end_actual] += segment[:segment_len]
+                    placed_count += 1
+            
+            # 每放置10个片段更新一次状态
+            if i % 10 == 0 and i > 0:
+                generation_status = f"🔄 已放置 {i+1}/{len(audio_segments)} 个片段..."
+                yield None, generation_status, match_details, "放置片段中..."
+        
+        generation_status = f"✅ 片段放置完成: {placed_count}/{len(audio_segments)} 个片段\n🔄 正在归一化..."
+        yield None, generation_status, match_details, "归一化中..."
         
         # 归一化
         final_audio = normalize_audio(final_audio)
+        
+        # 添加淡出效果，避免突然结束
+        fade_out_samples = int(0.05 * sr)
+        if fade_out_samples > 0 and fade_out_samples <= len(final_audio):
+            fade_out_window = np.linspace(1, 0, fade_out_samples)
+            final_audio[-fade_out_samples:] *= fade_out_window
+        
+        generation_status = f"✅ 音频处理完成\n🔄 正在生成报告..."
+        yield None, generation_status, match_details, "生成报告中..."
         
         # 5. 生成报告
         report = f"""
@@ -1254,21 +1698,29 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         
         ### 基本信息
         - **乐谱文件**: {os.path.basename(score_file)}
-        - **音符总数**: {len(notes)}
+        - **音符总数**: {len(notes)} (含休止符)
+        - **可匹配音符**: {total_valid_notes} (不含休止符)
         - **演奏速度**: {tempo} BPM
         - **总时长**: {total_samples/sr:.2f} 秒
+        - **采样率**: {sr} Hz
         
         ### 匹配情况
-        - **成功匹配**: {matched_count} 个音符 ({match_rate:.1f}%)
-        - **需要变调**: {sum(1 for n in notes if n['matched'] and abs(n['pitch_shift']) > 0.1)} 个
-        - **未匹配**: {len(notes) - matched_count} 个
+        - **成功匹配**: {matched_count} 个可匹配音符 ({match_rate:.1f}%)
+        - **需要变调**: {sum(1 for n in valid_notes if n['matched'] and abs(n.get('pitch_shift', 0)) > 0.1)} 个
+        - **未匹配**: {total_valid_notes - matched_count} 个
+        - **休止符**: {len(notes) - total_valid_notes} 个
+        
+        ### 音频处理
+        - **生成的片段**: {len(audio_segments)} 个
+        - **成功放置**: {placed_count} 个片段
+        - **峰值电平**: {np.max(np.abs(final_audio)):.3f}
         
         ### 使用片段
         """
         
         # 统计使用的片段
         used_clips = {}
-        for note in notes:
+        for note in valid_notes:
             if note['matched']:
                 clip_id = note['clip_id']
                 used_clips[clip_id] = used_clips.get(clip_id, 0) + 1
@@ -1278,10 +1730,43 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
             note_name = clip.get('note_info', {}).get('note', '未知')
             report += f"- **片段{clip_id}** ({note_name}): 使用 {count} 次\n"
         
-        report += f"\n### 音频信息\n"
-        report += f"- **采样率**: {sr} Hz\n"
-        report += f"- **位深度**: 32-bit 浮点\n"
-        report += f"- **峰值电平**: {np.max(np.abs(final_audio)):.3f}\n"
+        # >>> 修改点3：添加音轨与乐器统计 <<<
+        report += f"\n### 音轨与乐器信息\n"
+        # 统计音轨
+        tracks_used = set(n.get('track', 0) for n in notes if n.get('track') is not None)
+        report += f"- **使用音轨数**: {len(tracks_used)} 个\n"
+        
+        # 按音轨统计音符
+        if len(tracks_used) > 1:
+            report += f"- **各音轨音符分布**:\n"
+            for track_num in sorted(tracks_used):
+                track_notes = [n for n in notes if n.get('track', 0) == track_num and n['midi_pitch'] != -1]
+                if track_notes:
+                    instr = track_notes[0].get('instrument', 'unknown')
+                    report += f"  - 音轨{track_num} ({instr}): {len(track_notes)} 个音符\n"
+        
+        # 统计乐器（仅统计非休止符）
+        instruments_used = {}
+        for note in valid_notes:
+            instr = note.get('instrument', 'unknown')
+            instruments_used[instr] = instruments_used.get(instr, 0) + 1
+        
+        if instruments_used:
+            report += f"- **乐器分布**:\n"
+            for instr, count in sorted(instruments_used.items(), key=lambda x: x[1], reverse=True):
+                report += f"  - {instr}: {count} 个音符\n"
+        
+        report += f"\n### 调试信息\n"
+        report += f"- **最大结束时间**: {max_end_time_seconds:.2f} 秒\n"
+        report += f"- **总样本数**: {total_samples} 个\n"
+        report += f"- **实际时长**: {len(final_audio)/sr:.2f} 秒\n"
+        
+        # 如果有原始MIDI速度信息，显示对比
+        tempos = set(n.get('tempo') for n in notes if n.get('tempo'))
+        if len(tempos) == 1:
+            original_tempo = list(tempos)[0]
+            report += f"- **原始乐谱速度**: {original_tempo:.0f} BPM\n"
+            report += f"- **实际使用速度**: {tempo} BPM\n"
         
         report += f"\n⏱️ **生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}"
         
@@ -1292,15 +1777,14 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         
         generation_status = f"✅ 音乐生成完成！\n📁 已保存至: {output_filename}"
         
-        return (sr, final_audio), report, match_details, generation_status
+        yield (sr, final_audio), report, match_details, generation_status
         
     except Exception as e:
         error_msg = f"❌ 生成过程中出错: {str(e)}"
         print(f"生成音乐失败: {e}")
         import traceback
         traceback.print_exc()
-        return None, error_msg, [], "生成失败"
-
+        yield None, error_msg, [], "生成失败"
 
 # ========= 创建Gradio界面 =========
 
