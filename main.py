@@ -94,9 +94,28 @@ class AppConfig:
     confidence_threshold: float = 0.7
     
     # 文件路径
-    clip_dir: str = "clips"
     output_dir: str = "output"
     config_file: str = "config.json"
+    # 文件路径配置
+    data_dir: str = "data"  # 数据根目录
+    clip_subdir: str = "clips"  # 片段子目录
+    clip_data_filename: str = "clips.json"  # 片段数据文件名
+    
+    @property
+    def clip_dir(self) -> str:
+        """获取片段音频目录"""
+        return os.path.join(self.data_dir, self.clip_subdir)
+    
+    @property
+    def clip_data_file(self) -> str:
+        """获取片段数据文件路径"""
+        return os.path.join(self.data_dir, self.clip_data_filename)
+    
+    def __post_init__(self):
+        """初始化后确保目录存在"""
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.clip_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
 config = AppConfig()
 os.makedirs(config.clip_dir, exist_ok=True)
@@ -590,32 +609,31 @@ def convert_to_serializable(obj):
 class AudioClipManager:
     """音频片段管理器"""
     
-    def __init__(self):
+    def __init__(self, config: AppConfig):
+        self.config = config
         self.clips = []
         self.load_clips()
     
     def load_clips(self):
         """加载已保存的片段"""
-        if os.path.exists('clips.json'):
-            with open('clips.json', 'r', encoding='utf-8') as f:
+        if os.path.exists(self.config.clip_data_file):
+            with open(self.config.clip_data_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 self.clips = data.get('clips', [])
     
     def save_clips(self):
         """保存片段信息"""
-        # 转换所有数据为可序列化的Python原生类型
         clips_serializable = convert_to_serializable(self.clips)
         data = {'clips': clips_serializable}
-        with open('clips.json', 'w', encoding='utf-8') as f:
+        with open(self.config.clip_data_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     
     def add_clip(self, audio_data: np.ndarray, sr: int, 
                  note_info: Dict = None, metadata: Dict = None) -> str:
         """添加音频片段"""
-        # 生成文件名
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"clip_{timestamp}.wav"
-        filepath = os.path.join(config.clip_dir, filename)
+        filepath = os.path.join(self.config.clip_dir, filename)
         
         # 保存音频文件
         sf.write(filepath, audio_data, sr)
@@ -726,7 +744,7 @@ class AudioClipManager:
 
 # ========= Gradio界面函数 =========
 
-clip_manager = AudioClipManager()
+clip_manager = AudioClipManager(config)
 
 def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
     """处理音频上传"""
