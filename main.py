@@ -1486,6 +1486,16 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         if not notes:
             return None, "❌ 未能从乐谱中解析出音符", [], "解析失败"
         
+        # ============ 新增：优先使用MIDI文件的原始速度 ============
+        # 检查音符中是否包含原始速度信息
+        original_tempos = set(n.get('tempo') for n in notes if n.get('tempo') is not None)
+        if original_tempos and len(original_tempos) == 1:
+            original_tempo = list(original_tempos)[0]
+            if original_tempo != tempo:
+                print(f"[INFO] 使用MIDI文件原始速度: {original_tempo} BPM (覆盖用户设置的 {tempo} BPM)")
+                tempo = original_tempo
+        # ==========================================================
+        
         generation_status = f"✅ 解析完成，共 {len(notes)} 个音符\n🔄 开始匹配音频片段..."
         yield None, generation_status, [], "匹配中..."
         
@@ -1493,6 +1503,12 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         sr = config.sample_rate
         beat_duration = 60.0 / tempo
         match_details = []
+        
+        # ============ 新增：计算乐谱原始理论时长（用于调试） ============
+        max_beat_in_score = max([note['start_time'] + note['duration'] for note in notes])
+        theory_total_seconds = max_beat_in_score * beat_duration
+        print(f"[DEBUG_TIMING] 乐谱理论信息: 总拍数={max_beat_in_score:.2f}, tempo={tempo}, 理论时长={theory_total_seconds:.2f}秒")
+        # ==========================================================
         
         # 为每个音符匹配片段
         for i, note in enumerate(notes):
@@ -1558,19 +1574,31 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         audio_segments = []
         
         for i, note in enumerate(notes):
+            # ============ 新增：时间调试信息 ============
+            debug_info = f"音符{i}({note['note_name']}): start={note['start_time']:.2f}拍, dur={note['duration']:.2f}拍"
+            # ==========================================
+            
             # >>> 修改点2：优先处理休止符 <<<
             if note.get('is_rest') or note['midi_pitch'] == -1:
-                # 生成静音片段
-                silence_duration = note['duration'] * beat_duration
+                # 生成静音片段 - 关键修复：正确计算秒数
+                silence_duration = note['duration'] * beat_duration  # 拍 → 秒
                 silence_samples = int(silence_duration * sr)
-                audio_segments.append((note['start_time'], np.zeros(silence_samples, dtype=np.float32)))
+                # 关键：存储开始时间（秒），而不是拍数
+                start_time_seconds = note['start_time'] * beat_duration
+                audio_segments.append((start_time_seconds, np.zeros(silence_samples, dtype=np.float32)))
+                
+                print(f"[DEBUG_TIMING] {debug_info} -> 休止符: {silence_duration:.3f}秒, 开始于{start_time_seconds:.3f}秒")
                 continue
             
             # 处理未匹配的普通音符（生成静音）
             if not note['matched']:
-                silence_duration = note['duration'] * beat_duration
+                silence_duration = note['duration'] * beat_duration  # 拍 → 秒
                 silence_samples = int(silence_duration * sr)
-                audio_segments.append((note['start_time'], np.zeros(silence_samples, dtype=np.float32)))
+                # 关键：存储开始时间（秒），而不是拍数
+                start_time_seconds = note['start_time'] * beat_duration
+                audio_segments.append((start_time_seconds, np.zeros(silence_samples, dtype=np.float32)))
+                
+                print(f"[DEBUG_TIMING] {debug_info} -> 未匹配静音: {silence_duration:.3f}秒, 开始于{start_time_seconds:.3f}秒")
                 continue
             
             # 处理已匹配的普通音符
@@ -1578,7 +1606,7 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
             semitones = note['pitch_shift']
             
             # 如果已处理过相同变调的片段，直接重用
-            cache_key = f"{clip_id}_{semitones}"
+            cache_key = f"{clip_id}_{semitones:.2f}"  # 固定小数位数，避免浮点误差
             if cache_key not in processed_clips:
                 # 加载原始音频
                 clip = clip_manager.clips[clip_id]
@@ -1599,30 +1627,75 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
             # 获取处理后的音频
             y_processed = processed_clips[cache_key].copy()
             
-            # 时间拉伸以匹配音符时长
+            # 时间拉伸以匹配音符时长 - 关键：目标时长已经是秒
             target_duration = note['duration'] * beat_duration
             current_duration = len(y_processed) / sr
-            
-            if abs(current_duration - target_duration) > 0.01:  # 10ms容差
+
+            print(f"[DEBUG_TIMING] {debug_info} -> 音频: 当前{current_duration:.3f}秒, 目标{target_duration:.3f}秒")
+
+            # 只在小范围内使用时间拉伸
+            if 0.8 <= current_duration / target_duration <= 1.2:
+                # 差异在±20%以内，使用时间拉伸
                 rate = current_duration / target_duration
-                rate = np.clip(rate, 0.5, 2.0)  # 限制拉伸范围
                 y_processed = librosa.effects.time_stretch(y_processed, rate=rate)
-            
-            # 调整到精确长度
+                print(f"[DEBUG_TIMING] 小范围拉伸: 比率{rate:.3f}")
+
+            # 强制匹配目标长度（裁剪或填充）
             target_samples = int(target_duration * sr)
-            if len(y_processed) > target_samples:
-                y_processed = y_processed[:target_samples]
-            else:
-                y_processed = np.pad(y_processed, (0, target_samples - len(y_processed)), mode='constant')
+            if len(y_processed) != target_samples:
+                # 使用更智能的裁剪/填充
+                if len(y_processed) > target_samples:
+                    # 从中间裁剪，保持音符主体
+                    start = (len(y_processed) - target_samples) // 2
+                    y_processed = y_processed[start:start + target_samples]
+                else:
+                    # 填充静音
+                    y_processed = np.pad(y_processed, (0, target_samples - len(y_processed)), mode='constant')
+    
+            print(f"[DEBUG_TIMING] 长度调整: {len(y_processed)/sr:.3f}秒")
             
-            # 应用音量调整（基于velocity）
-            velocity_factor = note['velocity'] / 127.0
-            y_processed *= velocity_factor * 0.7  # 避免过载
+            # 应用音量调整（基于velocity） - 保持原MIDI响度关系
+            velocity_factor = note['velocity'] / 127.0  # 标准MIDI线性映射
+
+            # 使用线性映射，保持与原MIDI一致的响应
+            # 去掉曲线调整和固定系数，让velocity直接控制增益
+            y_processed *= velocity_factor
+
+            # 添加峰值限制（防止削波，但保持相对平衡）
+            max_amp = np.max(np.abs(y_processed))
+            if max_amp > 1.0:  # 只在实际削波时限制
+                y_processed *= 0.99 / max_amp  # 降低到99%避免削波
+                print(f"[DEBUG] 音符{note.get('pitch', '?')}: 限制峰值 {max_amp:.3f} -> 0.99")
+
+            # 先确保长度正确，再添加淡入淡出
+            target_samples = int(note['duration'] * beat_duration * sr)
+            if len(y_processed) != target_samples:
+                if len(y_processed) > target_samples:
+                    # 裁剪中间部分，保持音符主体
+                    start = (len(y_processed) - target_samples) // 2
+                    y_processed = y_processed[start:start + target_samples]
+                else:
+                    # 填充静音
+                    y_processed = np.pad(y_processed, (0, target_samples - len(y_processed)), mode='constant')
+
+            # 添加淡入淡出（避免应用于非常短的音符）
+            min_length_for_fade = int(0.05 * sr)  # 至少50ms
+            if len(y_processed) > min_length_for_fade:
+                # 自适应淡入淡出：短音符用较短淡出，长音符用标准淡出
+                note_duration = len(y_processed) / sr
+                
+                if note_duration < 0.2:  # 短音符 (<200ms)
+                    fade_in = min(0.01, note_duration * 0.1)
+                    fade_out = min(0.02, note_duration * 0.2)
+                else:  # 正常长度音符
+                    fade_in = 0.02
+                    fade_out = 0.05
+                
+                y_processed = apply_fade(y_processed, sr, fade_in=fade_in, fade_out=fade_out)
             
-            # 添加淡入淡出
-            y_processed = apply_fade(y_processed, sr, fade_in=0.02, fade_out=0.05)
-            
-            audio_segments.append((note['start_time'], y_processed))
+            # 关键：存储开始时间（秒），而不是拍数
+            start_time_seconds = note['start_time'] * beat_duration
+            audio_segments.append((start_time_seconds, y_processed))
             
             # 每处理10个片段更新一次状态
             if i % 10 == 0 and i > 0:
@@ -1633,17 +1706,20 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         generation_status = f"✅ 音频处理完成，共 {len(audio_segments)} 个音频片段\n🔄 开始拼接音乐..."
         yield None, generation_status, match_details, "拼接中..."
         
-        # 4. 拼接所有音频片段 - 关键修复部分
+        # 4. 拼接所有音频片段 - 关键修复：所有时间都以秒为单位
         # 计算总时长（以秒为单位）
         max_end_time_seconds = 0
         generation_status = f"🔄 正在计算总时长..."
         yield None, generation_status, match_details, "计算时长中..."
         
-        for start_time, segment in audio_segments:
+        for start_time_seconds, segment in audio_segments:
             segment_duration = len(segment) / sr
-            end_time_seconds = start_time * beat_duration + segment_duration
+            end_time_seconds = start_time_seconds + segment_duration
             if end_time_seconds > max_end_time_seconds:
                 max_end_time_seconds = end_time_seconds
+        
+        print(f"[DEBUG_TIMING] 音频片段最大结束时间: {max_end_time_seconds:.2f}秒")
+        print(f"[DEBUG_TIMING] 理论乐谱时长: {theory_total_seconds:.2f}秒")
         
         generation_status = f"✅ 总时长计算完成: {max_end_time_seconds:.2f}秒\n🔄 正在分配内存..."
         yield None, generation_status, match_details, "分配内存中..."
@@ -1655,10 +1731,10 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         generation_status = f"✅ 内存分配完成: {total_samples}个样本\n🔄 开始放置音频片段..."
         yield None, generation_status, match_details, "放置片段中..."
         
-        # 按时间线放置音频片段
+        # 按时间线放置音频片段 - 关键：所有时间都是秒，直接乘以sr得到样本位置
         placed_count = 0
-        for i, (start_time, segment) in enumerate(audio_segments):
-            start_sample = int(start_time * beat_duration * sr)
+        for i, (start_time_seconds, segment) in enumerate(audio_segments):
+            start_sample = int(start_time_seconds * sr)
             end_sample = start_sample + len(segment)
             
             # 确保片段在范围内
@@ -1693,6 +1769,7 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         yield None, generation_status, match_details, "生成报告中..."
         
         # 5. 生成报告
+        actual_duration = len(final_audio) / sr
         report = f"""
         ## 🎵 音乐生成报告
         
@@ -1701,7 +1778,9 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         - **音符总数**: {len(notes)} (含休止符)
         - **可匹配音符**: {total_valid_notes} (不含休止符)
         - **演奏速度**: {tempo} BPM
-        - **总时长**: {total_samples/sr:.2f} 秒
+        - **理论时长**: {theory_total_seconds:.2f} 秒
+        - **实际生成时长**: {actual_duration:.2f} 秒
+        - **时长比例**: {actual_duration/theory_total_seconds*100:.1f}%
         - **采样率**: {sr} Hz
         
         ### 匹配情况
@@ -1759,14 +1838,12 @@ def auto_generate_music_from_score(score_file, tempo=120, tolerance_cents=20.0, 
         report += f"\n### 调试信息\n"
         report += f"- **最大结束时间**: {max_end_time_seconds:.2f} 秒\n"
         report += f"- **总样本数**: {total_samples} 个\n"
-        report += f"- **实际时长**: {len(final_audio)/sr:.2f} 秒\n"
+        report += f"- **实际音频时长**: {actual_duration:.2f} 秒\n"
         
-        # 如果有原始MIDI速度信息，显示对比
-        tempos = set(n.get('tempo') for n in notes if n.get('tempo'))
-        if len(tempos) == 1:
-            original_tempo = list(tempos)[0]
+        # 显示原始速度信息（如果有）
+        if 'original_tempo' in locals():
             report += f"- **原始乐谱速度**: {original_tempo:.0f} BPM\n"
-            report += f"- **实际使用速度**: {tempo} BPM\n"
+        report += f"- **实际使用速度**: {tempo} BPM\n"
         
         report += f"\n⏱️ **生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}"
         
