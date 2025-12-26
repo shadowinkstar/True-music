@@ -1,6 +1,7 @@
 import os
 import time
 from typing import List
+import re
 
 import librosa
 import numpy as np
@@ -77,8 +78,19 @@ def generate_music_from_clips(clip_assignments, tempo):
     return f"✅ 音乐生成完成: {output_filename}", (sr, track)
 
 
+def _parse_source_sequence(sequence_text: str) -> List[str]:
+    if not sequence_text:
+        return []
+    tokens = re.split(r"[,\s，;；]+", sequence_text.strip())
+    return [token for token in tokens if token]
+
+
 def auto_generate_music_from_score(
-    score_file, tempo=120, tolerance_cents=20.0, use_pitch_shift=True
+    score_file,
+    tempo=120,
+    tolerance_cents=20.0,
+    use_pitch_shift=True,
+    source_sequence_text="",
 ):
     """
     自动从乐谱生成音乐的主函数
@@ -119,6 +131,8 @@ def auto_generate_music_from_score(
         sr = config.sample_rate
         beat_duration = 60.0 / tempo
         match_details = []
+        source_sequence = _parse_source_sequence(source_sequence_text)
+        sequence_index = 0
 
         # ============ 新增：计算乐谱原始理论时长（用于调试） ============
         max_beat_in_score = max([note["start_time"] + note["duration"] for note in notes])
@@ -149,8 +163,18 @@ def auto_generate_music_from_score(
                 )
                 continue  # 跳过后续匹配逻辑
 
+            required_tag = (
+                source_sequence[sequence_index % len(source_sequence)]
+                if source_sequence
+                else None
+            )
+
             # 寻找最佳匹配（仅针对普通音符）
-            best_clip, semitones_diff = find_best_match_for_note(target_midi, tolerance_cents)
+            best_clip, semitones_diff = find_best_match_for_note(
+                target_midi,
+                tolerance_cents,
+                required_tag=required_tag,
+            )
 
             if best_clip:
                 note["matched"] = True
@@ -167,7 +191,8 @@ def auto_generate_music_from_score(
                     [
                         f"音符{i+1}",
                         note["note_name"],
-                        f"片段{best_clip['id']} ({best_clip.get('note_info', {}).get('note', '未知')})",
+                        f"片段{best_clip['id']} ({best_clip.get('note_info', {}).get('note', '未知')})"
+                        + (f" [{required_tag}]" if required_tag else ""),
                         f"{semitones_diff:+.1f}" if use_pitch_shift else "0",
                         match_status,
                         note.get("track", 0),  # 新增：展示音轨信息
@@ -180,13 +205,15 @@ def auto_generate_music_from_score(
                     [
                         f"音符{i+1}",
                         note["note_name"],
-                        "无可用片段",
+                        f"无可用片段{f' (标签: {required_tag})' if required_tag else ''}",
                         "N/A",
                         "❌ 未匹配",
                         note.get("track", 0),
                         note.get("instrument", "unknown"),
                     ]
                 )
+
+            sequence_index += 1
 
         # 统计匹配结果（仅统计普通音符，排除休止符）
         valid_notes = [n for n in notes if n.get("midi_pitch", 0) != -1]
@@ -442,6 +469,7 @@ def auto_generate_music_from_score(
         - **音符总数**: {len(notes)} (含休止符)
         - **可匹配音符**: {total_valid_notes} (不含休止符)
         - **演奏速度**: {tempo} BPM
+        - **来源序列**: {" -> ".join(source_sequence) if source_sequence else "未启用"}
         - **理论时长**: {theory_total_seconds:.2f} 秒
         - **实际生成时长**: {actual_duration:.2f} 秒
         - **时长比例**: {actual_duration/theory_total_seconds*100:.1f}%

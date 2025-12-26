@@ -68,7 +68,7 @@ def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
                 else:
                     message.append("⚠️ 偏差较大")
         else:
-            message.append(f"❌ 目标音高 '{target_note}' 格式错误")
+            message.append(f"🏷️ 目标标签: **{target_note}** (用于匹配)")
 
     # 保存片段
     clip_info = clip_manager.add_clip(
@@ -180,6 +180,12 @@ def build_music_composition_tab():
                         info="对不匹配的音符自动变调处理",
                     )
 
+                source_sequence = gr.Textbox(
+                    label="来源序列 (可选)",
+                    placeholder="例如：哈,基,米",
+                    value="哈,基,米",
+                )
+
                 tempo_input = gr.Slider(
                     label="演奏速度 (BPM)",
                     minimum=40,
@@ -215,7 +221,13 @@ def build_music_composition_tab():
         # 连接生成按钮
         btn_generate.click(
             fn=auto_generate_music_from_score,
-            inputs=[score_upload, tempo_input, match_tolerance, use_pitch_shift],
+            inputs=[
+                score_upload,
+                tempo_input,
+                match_tolerance,
+                use_pitch_shift,
+                source_sequence,
+            ],
             outputs=[composition_audio, generation_report, notes_match_table, generation_status],
         )
 
@@ -447,11 +459,13 @@ def build_advanced_ui():
                     table_data = []
                     for clip in clips:
                         note_info = clip.get("note_info", {})
+                        metadata = clip.get("metadata", {}) or {}
                         table_data.append(
                             [
                                 clip["id"],
                                 clip["filename"],
                                 note_info.get("note", "未知"),
+                                metadata.get("target_note", "") or "",
                                 f"{note_info.get('frequency', 0):.1f}"
                                 if note_info.get("frequency")
                                 else "未知",
@@ -466,11 +480,20 @@ def build_advanced_ui():
 
                 with gr.Row():
                     clips_table = gr.Dataframe(
-                        headers=["ID", "文件名", "音名", "频率", "偏差", "时长", "创建时间"],
+                        headers=[
+                            "ID",
+                            "文件名",
+                            "音名",
+                            "匹配字",
+                            "频率",
+                            "偏差",
+                            "时长",
+                            "创建时间",
+                        ],
                         label="所有音频片段",
-                        datatype=["number", "str", "str", "str", "str", "str", "str"],
+                        datatype=["number", "str", "str", "str", "str", "str", "str", "str"],
                         row_count=10,
-                        col_count=7,
+                        col_count=8,
                         interactive=False,
                     )
 

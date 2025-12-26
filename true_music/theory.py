@@ -65,12 +65,16 @@ def midi_to_freq(midi: int) -> float:
 
 def freq_to_midi(freq: float) -> float:
     """频率转MIDI（浮点数，更精确）"""
+    if freq is None or not math.isfinite(freq) or freq <= 0:
+        return float("nan")
     return 69 + 12 * math.log2(freq / 440.0)
 
 
 def freq_to_note(freq: float) -> Tuple[str, float]:
     """频率转音名和音分偏差"""
     midi_float = freq_to_midi(freq)
+    if not math.isfinite(midi_float):
+        return "", 0.0
     midi_int = round(midi_float)
 
     # 计算音分偏差

@@ -6,7 +6,10 @@ from .theory import freq_to_midi
 
 
 def find_best_match_for_note(
-    target_midi: int, tolerance_cents: float = 50.0, use_confidence_weight: bool = True
+    target_midi: int,
+    tolerance_cents: float = 50.0,
+    use_confidence_weight: bool = True,
+    required_tag: Optional[str] = None,
 ) -> Tuple[Optional[dict], float]:
     """
     为目标音符寻找最佳匹配的音频片段（优化版）。
@@ -15,10 +18,13 @@ def find_best_match_for_note(
         target_midi: 目标MIDI音高 (整数，如 60 代表 C4)
         tolerance_cents: 音高容差 (音分)
         use_confidence_weight: 是否使用置信度作为权重
+        required_tag: 限制匹配到指定标签的片段（如 "哈"/"基"/"米"）
 
     返回:
         (最佳片段信息, 需要变调的半音数)
     """
+    required_tag = required_tag.strip() if required_tag else None
+
     # 1. 获取或构建索引
     index = build_clip_index()
     if not index:
@@ -40,6 +46,8 @@ def find_best_match_for_note(
 
         for clip_data in index[search_midi]:
             clip = clip_data["clip"]
+            if required_tag and not _clip_matches_tag(clip, required_tag):
+                continue
             clip_exact_midi = clip_data["exact_midi"]
             confidence = clip_data["confidence"]
 
@@ -73,6 +81,8 @@ def find_best_match_for_note(
         available_clips = manager.get_all_clips()
         best_distance = float("inf")
         for clip in available_clips:
+            if required_tag and not _clip_matches_tag(clip, required_tag):
+                continue
             note_info = clip.get("note_info", {})
             if note_info and note_info.get("frequency"):
                 clip_freq = note_info["frequency"]
@@ -85,3 +95,12 @@ def find_best_match_for_note(
                     best_semitones = semitones_diff
 
     return best_clip, best_semitones
+
+
+def _clip_matches_tag(clip: dict, required_tag: str) -> bool:
+    metadata = clip.get("metadata", {}) or {}
+    target_note = metadata.get("target_note", "")
+    if target_note and str(target_note).strip() == required_tag:
+        return True
+    tags = clip.get("tags") or []
+    return required_tag in tags

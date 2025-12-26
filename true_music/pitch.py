@@ -88,6 +88,23 @@ def detect_pitch_advanced(y: np.ndarray, sr: int) -> Dict[str, Any]:
             "stable": False,
         }
 
+    # 过滤无效频率
+    valid_items = [
+        (freq, conf)
+        for freq, conf in zip(freqs, confidences)
+        if freq is not None and np.isfinite(freq) and freq > 0
+    ]
+    if not valid_items:
+        return {
+            "frequency": None,
+            "note": None,
+            "cents": 0,
+            "confidence": 0,
+            "stable": False,
+        }
+
+    freqs, confidences = map(list, zip(*valid_items))
+
     # 加权平均
     weights = np.array(confidences)
     if weights.sum() == 0:
@@ -95,6 +112,15 @@ def detect_pitch_advanced(y: np.ndarray, sr: int) -> Dict[str, Any]:
 
     weighted_freq = np.average(freqs, weights=weights)
     avg_confidence = np.mean(confidences)
+
+    if not np.isfinite(weighted_freq) or weighted_freq <= 0:
+        return {
+            "frequency": None,
+            "note": None,
+            "cents": 0,
+            "confidence": 0,
+            "stable": False,
+        }
 
     # 转换为音名
     note_name, cents = freq_to_note(weighted_freq)
