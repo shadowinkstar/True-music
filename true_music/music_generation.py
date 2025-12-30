@@ -11,6 +11,7 @@ from .audio_processing import apply_fade, normalize_audio, pitch_shift
 from .context import get_config, require_clip_manager
 from .matching import find_best_match_for_note
 from .score_parser import parse_score_notes
+from .video_composition import compose_video_timeline
 
 
 def generate_music_from_clips(clip_assignments, tempo):
@@ -91,6 +92,7 @@ def auto_generate_music_from_score(
     tolerance_cents=20.0,
     use_pitch_shift=True,
     source_sequence_text="",
+    generate_video=False,
 ):
     """
     自动从乐谱生成音乐的主函数
@@ -99,16 +101,16 @@ def auto_generate_music_from_score(
     clip_manager = require_clip_manager()
 
     if not score_file:
-        return None, "请先上传乐谱文件", [], "⚠️ 未上传乐谱"
+        return None, "请先上传乐谱文件", [], "?? 未上传乐谱", None
 
     try:
         generation_status = "🚀 开始解析乐谱..."
-        yield None, generation_status, [], "解析中..."
+        yield None, generation_status, [], "解析中...", None
 
         # 1. 解析乐谱
         notes = parse_score_notes(score_file)
         if not notes:
-            return None, "❌ 未能从乐谱中解析出音符", [], "解析失败"
+            return None, "❌ 未能从乐谱中解析出音符", [], "解析失败", None
 
         # ============ 新增：优先使用MIDI文件的原始速度 ============
         # 检查音符中是否包含原始速度信息
@@ -125,12 +127,14 @@ def auto_generate_music_from_score(
         generation_status = (
             f"✅ 解析完成，共 {len(notes)} 个音符\n🔍 开始匹配音频片段..."
         )
-        yield None, generation_status, [], "匹配中..."
+        yield None, generation_status, [], "匹配中...", None
 
         # 2. 匹配音频片段
         sr = config.sample_rate
         beat_duration = 60.0 / tempo
         match_details = []
+        video_timeline = []
+        video_default_info = None
         source_sequence = _parse_source_sequence(source_sequence_text)
         sequence_index = 0
 
@@ -224,7 +228,7 @@ def auto_generate_music_from_score(
         generation_status = (
             f"✅ 匹配完成: {matched_count}/{total_valid_notes} 个可匹配音符 ({match_rate:.1f}%)\n🛠️ 开始处理音频..."
         )
-        yield None, generation_status, match_details, "处理中..."
+        yield None, generation_status, match_details, "处理中...", None
 
         # 3. 处理音频片段
         processed_clips = {}
@@ -247,6 +251,7 @@ def auto_generate_music_from_score(
                 audio_segments.append(
                     (start_time_seconds, np.zeros(silence_samples, dtype=np.float32))
                 )
+                video_timeline.append((start_time_seconds, silence_duration, None))
 
                 print(
                     f"[DEBUG_TIMING] {debug_info} -> 休止符: {silence_duration:.3f}秒, 开始于{start_time_seconds:.3f}秒"
@@ -262,6 +267,7 @@ def auto_generate_music_from_score(
                 audio_segments.append(
                     (start_time_seconds, np.zeros(silence_samples, dtype=np.float32))
                 )
+                video_timeline.append((start_time_seconds, silence_duration, None))
 
                 print(
                     f"[DEBUG_TIMING] {debug_info} -> 未匹配静音: {silence_duration:.3f}秒, 开始于{start_time_seconds:.3f}秒"
@@ -375,6 +381,16 @@ def auto_generate_music_from_score(
             # 关键：存储开始时间（秒），而不是拍数
             start_time_seconds = note["start_time"] * beat_duration
             audio_segments.append((start_time_seconds, y_processed))
+            clip_meta = clip_manager.clips[clip_id].get("metadata", {}) or {}
+            if clip_meta.get("video_info") and not video_default_info:
+                video_default_info = clip_meta.get("video_info")
+            video_timeline.append(
+                (
+                    start_time_seconds,
+                    target_duration,
+                    clip_meta if clip_meta.get("video_path") else None,
+                )
+            )
 
             # 每处理10个片段更新一次状态
             if i % 10 == 0 and i > 0:
@@ -388,18 +404,18 @@ def auto_generate_music_from_score(
                 generation_status = (
                     f"✅ 已处理 {processed_count}/{total_valid_notes} 个音符\n🛠️ 继续处理音频..."
                 )
-                yield None, generation_status, match_details, "处理中..."
+                yield None, generation_status, match_details, "处理中...", None
 
         generation_status = (
             f"✅ 音频处理完成，共 {len(audio_segments)} 个音频片段\n🎼 开始拼接音乐..."
         )
-        yield None, generation_status, match_details, "拼接中..."
+        yield None, generation_status, match_details, "拼接中...", None
 
         # 4. 拼接所有音频片段 - 关键修复：所有时间都以秒为单位
         # 计算总时长（以秒为单位）
         max_end_time_seconds = 0
         generation_status = "⏱️ 正在计算总时长..."
-        yield None, generation_status, match_details, "计算时长中..."
+        yield None, generation_status, match_details, "计算时长中...", None
 
         for start_time_seconds, segment in audio_segments:
             segment_duration = len(segment) / sr
@@ -411,14 +427,14 @@ def auto_generate_music_from_score(
         print(f"[DEBUG_TIMING] 理论乐谱时长: {theory_total_seconds:.2f}秒")
 
         generation_status = f"✅ 总时长计算完成: {max_end_time_seconds:.2f}秒\n🧠 正在分配内存..."
-        yield None, generation_status, match_details, "分配内存中..."
+        yield None, generation_status, match_details, "分配内存中...", None
 
         # 确保有足够的空间，加上0.5秒的余量
         total_samples = int(max_end_time_seconds * sr) + int(0.5 * sr)
         final_audio = np.zeros(total_samples, dtype=np.float32)
 
         generation_status = f"✅ 内存分配完成: {total_samples}个样本\n📌 开始放置音频片段..."
-        yield None, generation_status, match_details, "放置片段中..."
+        yield None, generation_status, match_details, "放置片段中...", None
 
         # 按时间线放置音频片段 - 关键：所有时间都是秒，直接乘以sr得到样本位置
         placed_count = 0
@@ -440,12 +456,12 @@ def auto_generate_music_from_score(
             # 每放置10个片段更新一次状态
             if i % 10 == 0 and i > 0:
                 generation_status = f"📌 已放置 {i+1}/{len(audio_segments)} 个片段..."
-                yield None, generation_status, match_details, "放置片段中..."
+                yield None, generation_status, match_details, "放置片段中...", None
 
         generation_status = (
             f"✅ 片段放置完成: {placed_count}/{len(audio_segments)} 个片段\n📈 正在归一化..."
         )
-        yield None, generation_status, match_details, "归一化中..."
+        yield None, generation_status, match_details, "归一化中...", None
 
         # 归一化
         final_audio = normalize_audio(final_audio)
@@ -457,7 +473,7 @@ def auto_generate_music_from_score(
             final_audio[-fade_out_samples:] *= fade_out_window
 
         generation_status = "✅ 音频处理完成\n📝 正在生成报告..."
-        yield None, generation_status, match_details, "生成报告中..."
+        yield None, generation_status, match_details, "生成报告中...", None
 
         # 5. 生成报告
         actual_duration = len(final_audio) / sr
@@ -551,10 +567,23 @@ def auto_generate_music_from_score(
         output_filename = f"auto_composition_{time.strftime('%Y%m%d_%H%M%S')}.wav"
         output_path = os.path.join(config.output_dir, output_filename)
         sf.write(output_path, final_audio, sr)
+        composition_video = None
+        if generate_video and video_timeline and video_default_info:
+            try:
+                composition_video = compose_video_timeline(
+                    video_timeline, video_default_info, audio_path=output_path
+                )
+                report += (
+                    f"\n### 视频合成\n- **输出视频**: {os.path.basename(composition_video)}\n"
+                )
+            except Exception as exc:
+                report += f"\n### 视频合成\n- **失败原因**: {str(exc)}\n"
+        elif generate_video:
+            report += "\n### 视频合成\n- **失败原因**: 未找到包含视频信息的片段\n"
 
-        generation_status = f"✅ 音乐生成完成！\n💾 已保存至: {output_filename}"
+        generation_status = f"? 音乐生成完成！\n?? 已保存至: {output_filename}"
 
-        yield (sr, final_audio), report, match_details, generation_status
+        yield (sr, final_audio), report, match_details, generation_status, composition_video
 
     except Exception as exc:
         error_msg = f"❌ 生成过程中出错: {str(exc)}"
@@ -562,4 +591,5 @@ def auto_generate_music_from_score(
         import traceback
 
         traceback.print_exc()
-        yield None, error_msg, [], "生成失败"
+        yield None, error_msg, [], "生成失败", None
+        

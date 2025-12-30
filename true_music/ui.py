@@ -1,3 +1,4 @@
+import os
 import time
 
 import gradio as gr
@@ -11,6 +12,7 @@ from .pitch import detect_pitch_advanced
 from .score_parser import parse_score_notes
 from .serialization import convert_to_serializable
 from .visualization import create_enhanced_analysis, create_spectrogram
+from .video_processing import process_video_to_clips
 
 
 def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
@@ -90,6 +92,56 @@ def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
         fig2 = create_enhanced_analysis(y, sr, note_info)
 
     return "\n".join(message), clip_info["id"], fig, fig2
+
+
+def handle_video_upload(video_input, auto_segment):
+    """处理视频上传并自动切片"""
+    clip_manager = require_clip_manager()
+
+    if video_input is None:
+        return "请先上传视频文件", []
+
+    try:
+        result = process_video_to_clips(video_input, auto_segment=auto_segment)
+    except Exception as exc:
+        return f"视频处理失败: {str(exc)}", []
+
+    segments = result.get("segments", [])
+    reason = result.get("reason")
+    if not segments:
+        return "未能从视频中提取片段", []
+
+    table_data = []
+    for seg in segments:
+        note_info = seg.get("note_info") or {}
+        clip_info = clip_manager.add_clip(
+            seg["audio"],
+            seg["sample_rate"],
+            note_info=convert_to_serializable(note_info),
+            metadata={
+                "video_source": str(video_input),
+                "video_path": seg.get("video_path", ""),
+                "video_start": seg.get("start", 0.0),
+                "video_end": seg.get("end", 0.0),
+                "video_info": seg.get("video_info", {}),
+                "upload_time": str(time.strftime("%Y-%m-%d %H:%M:%S")),
+            },
+        )
+        table_data.append(
+            [
+                clip_info["id"],
+                note_info.get("note") or "未知",
+                f"{seg.get('start', 0.0):.2f}",
+                f"{seg.get('end', 0.0):.2f}",
+                os.path.basename(seg.get("video_path", "")),
+            ]
+        )
+
+    message = [f"✅ 已生成 {len(table_data)} 个音频片段"]
+    if reason:
+        message.append(f"⚠️ 自动切割提示: {reason}")
+
+    return "\n".join(message), table_data
 
 
 def process_audio_clip(clip_id, operation, value):
@@ -180,6 +232,12 @@ def build_music_composition_tab():
                         info="对不匹配的音符自动变调处理",
                     )
 
+                generate_video = gr.Checkbox(
+                    label="生成拼接视频",
+                    value=False,
+                    info="需要片段包含视频信息",
+                )
+
                 source_sequence = gr.Textbox(
                     label="来源序列 (可选)",
                     placeholder="例如：哈,基,米",
@@ -206,7 +264,7 @@ def build_music_composition_tab():
                     with gr.TabItem("🎧 试听音乐"):
                         composition_audio = gr.Audio(label="生成音乐", type="numpy")
 
-                    with gr.TabItem("📊 生成报告"):
+                    with gr.TabItem("📋 生成报告"):
                         generation_report = gr.Markdown("生成报告将在此显示...", label="详细报告")
 
                     with gr.TabItem("🧩 音符匹配详情"):
@@ -218,6 +276,9 @@ def build_music_composition_tab():
                             interactive=False,
                         )
 
+                    with gr.TabItem("🎬 生成视频"):
+                        composition_video = gr.Video(label="生成视频", format="mp4")
+
         # 连接生成按钮
         btn_generate.click(
             fn=auto_generate_music_from_score,
@@ -227,8 +288,15 @@ def build_music_composition_tab():
                 match_tolerance,
                 use_pitch_shift,
                 source_sequence,
+                generate_video,
             ],
-            outputs=[composition_audio, generation_report, notes_match_table, generation_status],
+            outputs=[
+                composition_audio,
+                generation_report,
+                notes_match_table,
+                generation_status,
+                composition_video,
+            ],
         )
 
         # 乐谱上传后的预览
@@ -287,6 +355,28 @@ def build_advanced_ui():
         )
 
         with gr.Tabs():
+            with gr.TabItem("🎬 视频上传与识别"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        video_input = gr.Video(label="上传视频文件", format="mp4")
+                        auto_segment = gr.Checkbox(label="自动切割", value=True)
+                        btn_video_process = gr.Button("处理视频", variant="primary")
+
+                    with gr.Column(scale=2):
+                        video_result = gr.Markdown(label="处理结果")
+                        video_clips_table = gr.Dataframe(
+                            headers=["ID", "音名", "起点(秒)", "终点(秒)", "视频片段"],
+                            label="生成片段",
+                            datatype=["number", "str", "str", "str", "str"],
+                            row_count=10,
+                            interactive=False,
+                        )
+
+                btn_video_process.click(
+                    fn=handle_video_upload,
+                    inputs=[video_input, auto_segment],
+                    outputs=[video_result, video_clips_table],
+                )
             with gr.TabItem("🎙️ 音频上传与识别"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -564,3 +654,10 @@ def build_advanced_ui():
         )
 
     return demo
+
+
+
+
+
+
+

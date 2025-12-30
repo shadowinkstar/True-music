@@ -27,6 +27,8 @@ class AppConfig:
     data_dir: str = "data"  # 数据根目录
     clip_subdir: str = "clips"  # 片段子目录
     clip_data_filename: str = "clips.json"  # 片段数据文件名
+    video_subdir: str = "videos"  # 视频文件目录
+    video_clip_subdir: str = "video_clips"  # 视频片段目录
 
     @property
     def clip_dir(self) -> str:
@@ -38,8 +40,20 @@ class AppConfig:
         """获取片段数据文件路径"""
         return os.path.join(self.data_dir, self.clip_data_filename)
 
+    @property
+    def video_dir(self) -> str:
+        """获取视频目录"""
+        return os.path.join(self.data_dir, self.video_subdir)
+
+    @property
+    def video_clip_dir(self) -> str:
+        """获取视频片段目录"""
+        return os.path.join(self.data_dir, self.video_clip_subdir)
+
     def __post_init__(self):
         """初始化后确保目录存在"""
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.clip_dir, exist_ok=True)
+        os.makedirs(self.video_dir, exist_ok=True)
+        os.makedirs(self.video_clip_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
