@@ -7,10 +7,10 @@ from .context import get_config
 
 
 def _run_ffmpeg(args: List[str]) -> None:
-    completed = subprocess.run(args, check=False, capture_output=True, text=True)
+    print(f"[ffmpeg] {' '.join(args)}")
+    completed = subprocess.run(args, check=False)
     if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        raise RuntimeError(f"ffmpeg 执行失败: {stderr}")
+        raise RuntimeError(f"ffmpeg 执行失败，退出码: {completed.returncode}")
 
 
 def _ensure_segment_duration(
@@ -118,7 +118,8 @@ def compose_video_timeline(
     list_path = os.path.join(temp_dir, "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for path in segment_files:
-            f.write(f"file '{path}'\n")
+            abs_path = os.path.abspath(path).replace("\\", "/")
+            f.write(f"file '{abs_path}'\n")
 
     output_name = f"composition_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     output_path = os.path.join(config.output_dir, output_name)

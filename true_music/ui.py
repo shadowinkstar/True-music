@@ -7,7 +7,11 @@ import soundfile as sf
 
 from .audio_processing import apply_fade
 from .context import require_clip_manager
-from .music_generation import auto_generate_music_from_score, generate_music_from_clips
+from .music_generation import (
+    auto_generate_music_from_score,
+    generate_music_from_clips,
+    generate_video_from_last_composition,
+)
 from .pitch import detect_pitch_advanced
 from .score_parser import parse_score_notes
 from .serialization import convert_to_serializable
@@ -114,18 +118,23 @@ def handle_video_upload(video_input, auto_segment):
     table_data = []
     for seg in segments:
         note_info = seg.get("note_info") or {}
+        source_id = seg.get("source_id") or result.get("source_id")
+        source_name = seg.get("source_name") or result.get("source_name") or ""
         clip_info = clip_manager.add_clip(
             seg["audio"],
             seg["sample_rate"],
             note_info=convert_to_serializable(note_info),
             metadata={
                 "video_source": str(video_input),
+                "video_source_id": source_id,
+                "video_source_name": source_name,
                 "video_path": seg.get("video_path", ""),
                 "video_start": seg.get("start", 0.0),
                 "video_end": seg.get("end", 0.0),
                 "video_info": seg.get("video_info", {}),
                 "upload_time": str(time.strftime("%Y-%m-%d %H:%M:%S")),
             },
+            clip_subdir=source_id,
         )
         table_data.append(
             [
@@ -191,6 +200,7 @@ def process_audio_clip(clip_id, operation, value):
 
 def build_music_composition_tab():
     """构建全新的自动音乐制作界面"""
+    clip_manager = require_clip_manager()
 
     with gr.TabItem("🎼 智能音乐制作"):
         gr.Markdown(
@@ -244,6 +254,30 @@ def build_music_composition_tab():
                     value="哈,基,米",
                 )
 
+                def get_video_source_choices():
+                    sources = []
+                    seen = set()
+                    for clip in clip_manager.get_all_clips():
+                        metadata = clip.get("metadata", {}) or {}
+                        source_id = metadata.get("video_source_id")
+                        if not source_id or source_id in seen:
+                            continue
+                        source_name = (
+                            metadata.get("video_source_name")
+                            or os.path.basename(metadata.get("video_source", ""))
+                        )
+                        label = f"{source_name} [{source_id}]"
+                        sources.append(label)
+                        seen.add(source_id)
+                    return sorted(sources)
+
+                video_sources = gr.CheckboxGroup(
+                    label="视频来源筛选 (可选)",
+                    choices=get_video_source_choices(),
+                    info="仅匹配这些来源的视频片段；未选择则不限制",
+                )
+                btn_refresh_sources = gr.Button("刷新来源列表", variant="secondary")
+
                 tempo_input = gr.Slider(
                     label="演奏速度 (BPM)",
                     minimum=40,
@@ -278,16 +312,49 @@ def build_music_composition_tab():
 
                     with gr.TabItem("🎬 生成视频"):
                         composition_video = gr.Video(label="生成视频", format="mp4")
+                        video_status = gr.Markdown("等待生成视频...", label="视频状态")
+                        btn_generate_video = gr.Button("使用上次音频合成视频", variant="primary")
 
         # 连接生成按钮
+        def _parse_selected_sources(selected_labels):
+            selected_labels = selected_labels or []
+            source_ids = []
+            for label in selected_labels:
+                if "[" in label and label.endswith("]"):
+                    source_ids.append(label.rsplit("[", 1)[-1][:-1])
+                else:
+                    source_ids.append(label)
+            return ",".join(source_ids)
+
+        def _generate_with_sources(
+            score_file,
+            tempo,
+            tolerance_cents,
+            use_pitch_shift,
+            source_sequence_text,
+            selected_sources,
+            generate_video,
+        ):
+            allowed_sources_text = _parse_selected_sources(selected_sources)
+            yield from auto_generate_music_from_score(
+                score_file,
+                tempo,
+                tolerance_cents,
+                use_pitch_shift,
+                source_sequence_text,
+                allowed_sources_text,
+                generate_video,
+            )
+
         btn_generate.click(
-            fn=auto_generate_music_from_score,
+            fn=_generate_with_sources,
             inputs=[
                 score_upload,
                 tempo_input,
                 match_tolerance,
                 use_pitch_shift,
                 source_sequence,
+                video_sources,
                 generate_video,
             ],
             outputs=[
@@ -297,6 +364,19 @@ def build_music_composition_tab():
                 generation_status,
                 composition_video,
             ],
+        )
+
+        btn_generate_video.click(
+            fn=generate_video_from_last_composition,
+            inputs=[],
+            outputs=[video_status, composition_video],
+        )
+
+        def _refresh_video_sources():
+            return gr.update(choices=get_video_source_choices())
+
+        btn_refresh_sources.click(
+            fn=_refresh_video_sources, inputs=[], outputs=[video_sources]
         )
 
         # 乐谱上传后的预览
@@ -544,18 +624,25 @@ def build_advanced_ui():
             with gr.TabItem("📁 片段管理"):
                 clip_manager = require_clip_manager()
 
-                def update_clips_table():
+                def update_clips_table(selected_id=None):
                     clips = clip_manager.get_all_clips()
                     table_data = []
                     for clip in clips:
                         note_info = clip.get("note_info", {})
                         metadata = clip.get("metadata", {}) or {}
+                        source_name = (
+                            metadata.get("video_source_name")
+                            or os.path.basename(metadata.get("video_source", ""))
+                        )
+                        selected_mark = "✓" if selected_id == clip["id"] else ""
                         table_data.append(
                             [
+                                selected_mark,
                                 clip["id"],
                                 clip["filename"],
                                 note_info.get("note", "未知"),
                                 metadata.get("target_note", "") or "",
+                                source_name,
                                 f"{note_info.get('frequency', 0):.1f}"
                                 if note_info.get("frequency")
                                 else "未知",
@@ -571,46 +658,108 @@ def build_advanced_ui():
                 with gr.Row():
                     clips_table = gr.Dataframe(
                         headers=[
+                            "选中",
                             "ID",
                             "文件名",
                             "音名",
                             "匹配字",
+                            "来源视频",
                             "频率",
                             "偏差",
                             "时长",
                             "创建时间",
                         ],
                         label="所有音频片段",
-                        datatype=["number", "str", "str", "str", "str", "str", "str", "str"],
+                        datatype=[
+                            "str",
+                            "number",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                        ],
                         row_count=10,
-                        col_count=8,
+                        col_count=10,
                         interactive=False,
                     )
 
                 with gr.Row():
                     btn_refresh = gr.Button("刷新列表")
-                    delete_clip_id = gr.Number(label="删除片段ID", value=0, precision=0)
+                    selected_clip_id = gr.Number(label="选中片段ID", value=0, precision=0)
                     btn_delete = gr.Button("删除片段", variant="stop")
 
                 with gr.Row():
+                    btn_preview = gr.Button("预览片段音频", variant="primary")
+                    preview_audio = gr.Audio(label="片段试听", type="numpy")
+
+                with gr.Row():
                     btn_cleanup = gr.Button("清理孤立文件", variant="secondary")
+                    selected_state = gr.State(0)
 
-                def cleanup_orphaned():
+                def cleanup_orphaned(selected_id):
                     clip_manager.cleanup_orphaned_files()
-                    return "已清理孤立文件", update_clips_table()
+                    return "已清理孤立文件", update_clips_table(selected_id)
 
-                btn_cleanup.click(fn=cleanup_orphaned, inputs=[], outputs=[compose_result, clips_table])
+                btn_cleanup.click(
+                    fn=cleanup_orphaned, inputs=[selected_state], outputs=[compose_result, clips_table]
+                )
 
                 def delete_selected_clip(clip_id):
                     success = clip_manager.delete_clip(int(clip_id))
                     if success:
-                        return f"✅ 已删除片段 {clip_id}", update_clips_table()
-                    return f"❌ 删除失败，片段 {clip_id} 不存在", update_clips_table()
+                        return f"✅ 已删除片段 {clip_id}", update_clips_table(clip_id)
+                    return f"❌ 删除失败，片段 {clip_id} 不存在", update_clips_table(clip_id)
 
-                btn_refresh.click(fn=update_clips_table, inputs=[], outputs=[clips_table])
+                btn_refresh.click(
+                    fn=update_clips_table, inputs=[selected_state], outputs=[clips_table]
+                )
 
                 btn_delete.click(
-                    fn=delete_selected_clip, inputs=[delete_clip_id], outputs=[compose_result, clips_table]
+                    fn=delete_selected_clip, inputs=[selected_clip_id], outputs=[compose_result, clips_table]
+                )
+
+                def preview_selected_clip(clip_id):
+                    if not 0 <= int(clip_id) < len(clip_manager.clips):
+                        return None
+                    clip = clip_manager.clips[int(clip_id)]
+                    y, sr = sf.read(clip["filepath"])
+                    if y.ndim > 1:
+                        y = np.mean(y, axis=1)
+                    if y.dtype != np.float32:
+                        y = y.astype(np.float32)
+                    y = np.clip(y, -1.0, 1.0)
+                    y_int16 = (y * 32767.0).astype(np.int16)
+                    return (sr, y_int16)
+
+                btn_preview.click(
+                    fn=preview_selected_clip, inputs=[selected_clip_id], outputs=[preview_audio]
+                )
+
+                def select_row(selected_id, evt: gr.SelectData):
+                    row_index = evt.index[0] if evt.index else None
+                    if row_index is None or row_index >= len(clip_manager.clips):
+                        return selected_id, update_clips_table(selected_id), selected_id
+                    clip_id = clip_manager.clips[row_index]["id"]
+                    return clip_id, update_clips_table(clip_id), clip_id
+
+                def select_id(clip_id):
+                    if clip_id is None:
+                        return update_clips_table(None), 0
+                    clip_id = int(clip_id)
+                    return update_clips_table(clip_id), clip_id
+
+                clips_table.select(
+                    fn=select_row,
+                    inputs=[selected_state],
+                    outputs=[selected_clip_id, clips_table, selected_state],
+                )
+
+                selected_clip_id.change(
+                    fn=select_id, inputs=[selected_clip_id], outputs=[clips_table, selected_state]
                 )
 
             build_music_composition_tab()
@@ -654,7 +803,6 @@ def build_advanced_ui():
         )
 
     return demo
-
 
 
 

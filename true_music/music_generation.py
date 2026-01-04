@@ -13,6 +13,30 @@ from .matching import find_best_match_for_note
 from .score_parser import parse_score_notes
 from .video_composition import compose_video_timeline
 
+_last_video_context = {
+    "video_timeline": None,
+    "video_default_info": None,
+    "audio_path": None,
+}
+
+
+def generate_video_from_last_composition():
+    """基于最近一次生成结果合成视频（便于先试听再生成视频）"""
+    timeline = _last_video_context.get("video_timeline")
+    video_info = _last_video_context.get("video_default_info")
+    audio_path = _last_video_context.get("audio_path")
+
+    if not timeline or not audio_path:
+        return "未找到可用的生成记录，请先生成音频", None
+    if not video_info:
+        return "未找到包含视频信息的片段，无法生成视频", None
+
+    try:
+        output_path = compose_video_timeline(timeline, video_info, audio_path=audio_path)
+        return f"✅ 视频合成完成: {os.path.basename(output_path)}", output_path
+    except Exception as exc:
+        return f"❌ 视频合成失败: {str(exc)}", None
+
 
 def generate_music_from_clips(clip_assignments, tempo):
     """从片段生成音乐"""
@@ -92,6 +116,7 @@ def auto_generate_music_from_score(
     tolerance_cents=20.0,
     use_pitch_shift=True,
     source_sequence_text="",
+    allowed_video_sources_text="",
     generate_video=False,
 ):
     """
@@ -136,6 +161,7 @@ def auto_generate_music_from_score(
         video_timeline = []
         video_default_info = None
         source_sequence = _parse_source_sequence(source_sequence_text)
+        allowed_video_sources = _parse_source_sequence(allowed_video_sources_text)
         sequence_index = 0
 
         # ============ 新增：计算乐谱原始理论时长（用于调试） ============
@@ -178,6 +204,7 @@ def auto_generate_music_from_score(
                 target_midi,
                 tolerance_cents,
                 required_tag=required_tag,
+                allowed_sources=allowed_video_sources,
             )
 
             if best_clip:
@@ -568,6 +595,11 @@ def auto_generate_music_from_score(
         output_path = os.path.join(config.output_dir, output_filename)
         sf.write(output_path, final_audio, sr)
         composition_video = None
+
+        # 缓存最近一次生成结果，供后续视频合成
+        _last_video_context["video_timeline"] = video_timeline
+        _last_video_context["video_default_info"] = video_default_info
+        _last_video_context["audio_path"] = output_path
         if generate_video and video_timeline and video_default_info:
             try:
                 composition_video = compose_video_timeline(

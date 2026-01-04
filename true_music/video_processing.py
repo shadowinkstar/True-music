@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
@@ -13,18 +14,32 @@ from .pitch import detect_pitch_advanced
 
 
 def _run_ffmpeg(args: List[str]) -> None:
-    completed = subprocess.run(args, check=False, capture_output=True, text=True)
+    print(f"[ffmpeg] {' '.join(args)}")
+    completed = subprocess.run(args, check=False)
     if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        raise RuntimeError(f"ffmpeg 执行失败: {stderr}")
+        raise RuntimeError(f"ffmpeg 执行失败，退出码: {completed.returncode}")
 
 
 def _run_ffprobe(args: List[str]) -> Dict:
-    completed = subprocess.run(args, check=False, capture_output=True, text=True)
+    completed = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if completed.returncode != 0:
         stderr = completed.stderr.strip()
         raise RuntimeError(f"ffprobe 执行失败: {stderr}")
     return json.loads(completed.stdout or "{}")
+
+
+def _sanitize_name(name: str) -> str:
+    base = os.path.splitext(os.path.basename(name or ""))[0]
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", base)
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    return safe or "source"
 
 
 def probe_video_info(video_path: str) -> Dict[str, float]:
@@ -183,6 +198,11 @@ def process_video_to_clips(video_path: str, auto_segment: bool = True) -> Dict[s
         return {"error": "无法解析视频信息", "segments": []}
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    source_name = os.path.basename(video_path)
+    source_id = f"{_sanitize_name(source_name)}_{timestamp}"
+    source_video_dir = os.path.join(config.video_clip_dir, source_id)
+    os.makedirs(source_video_dir, exist_ok=True)
+
     audio_path = os.path.join(config.video_dir, f"video_audio_{timestamp}.wav")
     extract_audio_to_wav(video_path, audio_path, config.sample_rate)
 
@@ -205,7 +225,7 @@ def process_video_to_clips(video_path: str, auto_segment: bool = True) -> Dict[s
         note_info = detect_pitch_advanced(audio_clip, sr)
 
         seg_filename = f"video_seg_{timestamp}_{idx:04d}.mp4"
-        seg_path = os.path.join(config.video_clip_dir, seg_filename)
+        seg_path = os.path.join(source_video_dir, seg_filename)
         cut_video_segment(
             video_path,
             seg_path,
@@ -225,6 +245,8 @@ def process_video_to_clips(video_path: str, auto_segment: bool = True) -> Dict[s
                 "note_info": note_info,
                 "video_path": seg_path,
                 "video_info": video_info,
+                "source_id": source_id,
+                "source_name": source_name,
             }
         )
 
@@ -233,4 +255,6 @@ def process_video_to_clips(video_path: str, auto_segment: bool = True) -> Dict[s
         "reason": reason,
         "audio_path": audio_path,
         "video_info": video_info,
+        "source_id": source_id,
+        "source_name": source_name,
     }

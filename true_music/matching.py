@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .clip_manager import build_clip_index
 from .context import get_clip_manager
@@ -10,6 +10,7 @@ def find_best_match_for_note(
     tolerance_cents: float = 50.0,
     use_confidence_weight: bool = True,
     required_tag: Optional[str] = None,
+    allowed_sources: Optional[List[str]] = None,
 ) -> Tuple[Optional[dict], float]:
     """
     为目标音符寻找最佳匹配的音频片段（优化版）。
@@ -24,6 +25,7 @@ def find_best_match_for_note(
         (最佳片段信息, 需要变调的半音数)
     """
     required_tag = required_tag.strip() if required_tag else None
+    allowed_sources = [str(s).strip() for s in (allowed_sources or []) if str(s).strip()]
 
     # 1. 获取或构建索引
     index = build_clip_index()
@@ -47,6 +49,8 @@ def find_best_match_for_note(
         for clip_data in index[search_midi]:
             clip = clip_data["clip"]
             if required_tag and not _clip_matches_tag(clip, required_tag):
+                continue
+            if allowed_sources and not _clip_matches_source(clip, allowed_sources):
                 continue
             clip_exact_midi = clip_data["exact_midi"]
             confidence = clip_data["confidence"]
@@ -83,6 +87,8 @@ def find_best_match_for_note(
         for clip in available_clips:
             if required_tag and not _clip_matches_tag(clip, required_tag):
                 continue
+            if allowed_sources and not _clip_matches_source(clip, allowed_sources):
+                continue
             note_info = clip.get("note_info", {})
             if note_info and note_info.get("frequency"):
                 clip_freq = note_info["frequency"]
@@ -104,3 +110,11 @@ def _clip_matches_tag(clip: dict, required_tag: str) -> bool:
         return True
     tags = clip.get("tags") or []
     return required_tag in tags
+
+
+def _clip_matches_source(clip: dict, allowed_sources: List[str]) -> bool:
+    metadata = clip.get("metadata", {}) or {}
+    source_id = metadata.get("video_source_id", "")
+    if not source_id:
+        return False
+    return str(source_id).strip() in allowed_sources

@@ -89,12 +89,22 @@ class AudioClipManager:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def add_clip(
-        self, audio_data: np.ndarray, sr: int, note_info: Dict = None, metadata: Dict = None
+        self,
+        audio_data: np.ndarray,
+        sr: int,
+        note_info: Dict = None,
+        metadata: Dict = None,
+        clip_subdir: Optional[str] = None,
     ) -> str:
         """添加音频片段"""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"clip_{timestamp}.wav"
-        filepath = os.path.join(self.config.clip_dir, filename)
+        if clip_subdir:
+            base_dir = os.path.join(self.config.clip_dir, clip_subdir)
+            os.makedirs(base_dir, exist_ok=True)
+        else:
+            base_dir = self.config.clip_dir
+        filepath = os.path.join(base_dir, filename)
 
         # 保存音频文件
         sf.write(filepath, audio_data, sr)
@@ -172,19 +182,21 @@ class AudioClipManager:
     def cleanup_orphaned_files(self):
         """清理没有对应记录的音频文件"""
         # 获取所有应该存在的文件路径
-        expected_files = {clip["filepath"] for clip in self.clips}
+        expected_files = {os.path.normpath(clip["filepath"]) for clip in self.clips}
 
         # 遍历clips目录
         clips_dir = self.config.clip_dir
-        for filename in os.listdir(clips_dir):
-            if filename.endswith(".wav"):
-                filepath = os.path.join(clips_dir, filename)
+        for root, _, files in os.walk(clips_dir):
+            for filename in files:
+                if not filename.endswith(".wav"):
+                    continue
+                filepath = os.path.normpath(os.path.join(root, filename))
                 if filepath not in expected_files:
                     try:
                         os.remove(filepath)
-                        print(f"清理孤立文件: {filename}")
+                        print(f"清理孤立文件: {filepath}")
                     except Exception as exc:
-                        print(f"清理文件失败 {filename}: {exc}")
+                        print(f"清理文件失败 {filepath}: {exc}")
 
     def delete_all_clips(self):
         """删除所有片段和对应的文件"""
