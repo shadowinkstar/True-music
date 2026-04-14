@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List
+from typing import Dict, List
 import re
 
 import librosa
@@ -18,6 +18,74 @@ _last_video_context = {
     "video_default_info": None,
     "audio_path": None,
 }
+
+
+def _compute_rms(y: np.ndarray) -> float:
+    if len(y) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(y, dtype=np.float64))))
+
+
+def _estimate_peak_polyphony(track_notes: List[Dict]) -> int:
+    events = []
+    for note in track_notes:
+        if note.get("midi_pitch", -1) == -1:
+            continue
+        start = float(note.get("start_time", 0.0))
+        end = start + float(note.get("duration", 0.0))
+        events.append((start, 1))
+        events.append((end, -1))
+
+    active = 0
+    peak = 0
+    for _, delta in sorted(events, key=lambda item: (item[0], -item[1])):
+        active += delta
+        peak = max(peak, active)
+    return max(peak, 1) if events else 1
+
+
+def _analyze_track_mix(notes: List[Dict]) -> Dict[str, object]:
+    track_notes: Dict[int, List[Dict]] = {}
+    for note in notes:
+        if note.get("midi_pitch", -1) == -1:
+            continue
+        track_num = int(note.get("track", 0) or 0)
+        track_notes.setdefault(track_num, []).append(note)
+
+    if not track_notes:
+        return {"lead_track": 0, "track_stats": {}, "gain_map": {0: 1.0}}
+
+    track_stats: Dict[int, Dict[str, float]] = {}
+    for track_num, items in track_notes.items():
+        avg_midi = float(np.mean([note["midi_pitch"] for note in items]))
+        avg_velocity = float(np.mean([note.get("velocity", 64) for note in items]))
+        peak_polyphony = _estimate_peak_polyphony(items)
+        score = avg_midi + (avg_velocity / 24.0) - (peak_polyphony - 1) * 8.0
+        track_stats[track_num] = {
+            "avg_midi": avg_midi,
+            "avg_velocity": avg_velocity,
+            "peak_polyphony": float(peak_polyphony),
+            "note_count": float(len(items)),
+            "lead_score": score,
+        }
+
+    lead_track = max(track_stats, key=lambda track_num: track_stats[track_num]["lead_score"])
+    lead_avg_midi = track_stats[lead_track]["avg_midi"]
+
+    gain_map: Dict[int, float] = {}
+    for track_num, stats in track_stats.items():
+        if track_num == lead_track:
+            gain_map[track_num] = 1.0
+            continue
+
+        gain = 0.62
+        if stats["peak_polyphony"] > 1:
+            gain -= min(0.22, (stats["peak_polyphony"] - 1) * 0.08)
+        if stats["avg_midi"] < lead_avg_midi - 12:
+            gain -= 0.07
+        gain_map[track_num] = float(np.clip(gain, 0.35, 0.62))
+
+    return {"lead_track": lead_track, "track_stats": track_stats, "gain_map": gain_map}
 
 
 def generate_video_from_last_composition():
@@ -160,6 +228,9 @@ def auto_generate_music_from_score(
         match_details = []
         video_timeline = []
         video_default_info = None
+        mix_analysis = _analyze_track_mix(notes)
+        lead_track = int(mix_analysis["lead_track"])
+        track_gain_map = mix_analysis["gain_map"]
         source_sequence = _parse_source_sequence(source_sequence_text)
         allowed_video_sources = _parse_source_sequence(allowed_video_sources_text)
         sequence_index = 0
@@ -276,7 +347,11 @@ def auto_generate_music_from_score(
                 # 关键：存储开始时间（秒），而不是拍数
                 start_time_seconds = note["start_time"] * beat_duration
                 audio_segments.append(
-                    (start_time_seconds, np.zeros(silence_samples, dtype=np.float32))
+                    (
+                        start_time_seconds,
+                        np.zeros(silence_samples, dtype=np.float32),
+                        int(note.get("track", 0) or 0),
+                    )
                 )
                 video_timeline.append((start_time_seconds, silence_duration, None))
 
@@ -292,7 +367,11 @@ def auto_generate_music_from_score(
                 # 关键：存储开始时间（秒），而不是拍数
                 start_time_seconds = note["start_time"] * beat_duration
                 audio_segments.append(
-                    (start_time_seconds, np.zeros(silence_samples, dtype=np.float32))
+                    (
+                        start_time_seconds,
+                        np.zeros(silence_samples, dtype=np.float32),
+                        int(note.get("track", 0) or 0),
+                    )
                 )
                 video_timeline.append((start_time_seconds, silence_duration, None))
 
@@ -320,7 +399,7 @@ def auto_generate_music_from_score(
 
                 # 变调处理
                 if use_pitch_shift and abs(semitones) > 0.1:
-                    y = pitch_shift(y, sr, semitones)
+                    y = pitch_shift(y, sr, semitones, mode="preserve_attack")
 
                 processed_clips[cache_key] = y
 
@@ -407,7 +486,7 @@ def auto_generate_music_from_score(
 
             # 关键：存储开始时间（秒），而不是拍数
             start_time_seconds = note["start_time"] * beat_duration
-            audio_segments.append((start_time_seconds, y_processed))
+            audio_segments.append((start_time_seconds, y_processed, int(note.get("track", 0) or 0)))
             clip_meta = clip_manager.clips[clip_id].get("metadata", {}) or {}
             if clip_meta.get("video_info") and not video_default_info:
                 video_default_info = clip_meta.get("video_info")
@@ -444,7 +523,7 @@ def auto_generate_music_from_score(
         generation_status = "⏱️ 正在计算总时长..."
         yield None, generation_status, match_details, "计算时长中...", None
 
-        for start_time_seconds, segment in audio_segments:
+        for start_time_seconds, segment, _track_num in audio_segments:
             segment_duration = len(segment) / sr
             end_time_seconds = start_time_seconds + segment_duration
             if end_time_seconds > max_end_time_seconds:
@@ -458,6 +537,10 @@ def auto_generate_music_from_score(
 
         # 确保有足够的空间，加上0.5秒的余量
         total_samples = int(max_end_time_seconds * sr) + int(0.5 * sr)
+        track_buffers: Dict[int, np.ndarray] = {
+            int(track_num): np.zeros(total_samples, dtype=np.float32)
+            for track_num in track_gain_map
+        }
         final_audio = np.zeros(total_samples, dtype=np.float32)
 
         generation_status = f"✅ 内存分配完成: {total_samples}个样本\n📌 开始放置音频片段..."
@@ -465,7 +548,7 @@ def auto_generate_music_from_score(
 
         # 按时间线放置音频片段 - 关键：所有时间都是秒，直接乘以sr得到样本位置
         placed_count = 0
-        for i, (start_time_seconds, segment) in enumerate(audio_segments):
+        for i, (start_time_seconds, segment, track_num) in enumerate(audio_segments):
             start_sample = int(start_time_seconds * sr)
             end_sample = start_sample + len(segment)
 
@@ -476,8 +559,10 @@ def auto_generate_music_from_score(
                 # 确保段长度正确
                 segment_len = end_actual - start_sample
                 if segment_len > 0:
-                    # 使用叠加而不是覆盖
-                    final_audio[start_sample:end_actual] += segment[:segment_len]
+                    track_num = int(track_num)
+                    if track_num not in track_buffers:
+                        track_buffers[track_num] = np.zeros(total_samples, dtype=np.float32)
+                    track_buffers[track_num][start_sample:end_actual] += segment[:segment_len]
                     placed_count += 1
 
             # 每放置10个片段更新一次状态
@@ -486,11 +571,32 @@ def auto_generate_music_from_score(
                 yield None, generation_status, match_details, "放置片段中...", None
 
         generation_status = (
-            f"✅ 片段放置完成: {placed_count}/{len(audio_segments)} 个片段\n📈 正在归一化..."
+            f"✅ 片段放置完成: {placed_count}/{len(audio_segments)} 个片段\n🎚️ 正在按轨道混音..."
         )
+        yield None, generation_status, match_details, "混音中...", None
+
+        track_mix_results = []
+        for track_num, track_audio in sorted(track_buffers.items()):
+            peak_before = float(np.max(np.abs(track_audio))) if len(track_audio) else 0.0
+            rms_before = _compute_rms(track_audio)
+            gain = float(track_gain_map.get(track_num, 0.55))
+            if peak_before > 0.95:
+                track_audio *= 0.95 / peak_before
+            peak_after_limit = float(np.max(np.abs(track_audio))) if len(track_audio) else 0.0
+            final_audio += track_audio * gain
+            track_mix_results.append(
+                {
+                    "track": track_num,
+                    "gain": gain,
+                    "peak_before": peak_before,
+                    "peak_after_limit": peak_after_limit,
+                    "rms_before": rms_before,
+                }
+            )
+
+        generation_status = "✅ 轨道混音完成\n📈 正在归一化..."
         yield None, generation_status, match_details, "归一化中...", None
 
-        # 归一化
         final_audio = normalize_audio(final_audio)
 
         # 添加淡出效果，避免突然结束
@@ -551,6 +657,7 @@ def auto_generate_music_from_score(
             n.get("track", 0) for n in notes if n.get("track") is not None
         )
         report += f"- **使用音轨数**: {len(tracks_used)} 个\n"
+        report += f"- **自动识别主音轨**: 轨道{lead_track}\n"
 
         # 按音轨统计音符
         if len(tracks_used) > 1:
@@ -564,6 +671,20 @@ def auto_generate_music_from_score(
                 if track_notes:
                     instr = track_notes[0].get("instrument", "unknown")
                     report += f"  - 音轨{track_num} ({instr}): {len(track_notes)} 个音符\n"
+
+        if track_mix_results:
+            report += "- **各音轨混音参数**:\n"
+            for track_result in track_mix_results:
+                track_num = track_result["track"]
+                track_stat = mix_analysis["track_stats"].get(track_num, {})
+                report += (
+                    "  - "
+                    f"音轨{track_num}: gain={track_result['gain']:.2f}, "
+                    f"peak={track_result['peak_before']:.3f}->{track_result['peak_after_limit']:.3f}, "
+                    f"rms={track_result['rms_before']:.3f}, "
+                    f"avg_midi={track_stat.get('avg_midi', 0.0):.1f}, "
+                    f"poly={track_stat.get('peak_polyphony', 1.0):.0f}\n"
+                )
 
         # 统计乐器（仅统计非休止符）
         instruments_used = {}

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -98,7 +99,8 @@ class AudioClipManager:
     ) -> str:
         """添加音频片段"""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"clip_{timestamp}.wav"
+        unique_token = f"{time.time_ns() % 1_000_000_000:09d}"
+        filename = f"clip_{timestamp}_{unique_token}.wav"
         if clip_subdir:
             base_dir = os.path.join(self.config.clip_dir, clip_subdir)
             os.makedirs(base_dir, exist_ok=True)
@@ -170,6 +172,29 @@ class AudioClipManager:
             except Exception as exc:
                 print(f"删除音频文件时出错 {clip['filepath']}: {exc}")
 
+            metadata = clip.get("metadata", {}) or {}
+            video_path = metadata.get("video_path")
+            if video_path:
+                try:
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                        print(f"已删除视频片段: {video_path}")
+                except Exception as exc:
+                    print(f"删除视频片段时出错 {video_path}: {exc}")
+
+            source_id = metadata.get("video_source_id")
+            source_path = metadata.get("video_source")
+            source_audio_path = metadata.get("video_audio_path")
+            if source_id:
+                remaining = any(
+                    (c.get("metadata", {}) or {}).get("video_source_id") == source_id
+                    for c in self.clips
+                )
+                if not remaining:
+                    self._remove_video_source_assets(
+                        source_id, source_path=source_path, audio_path=source_audio_path
+                    )
+
             # 更新ID
             for i, clip_item in enumerate(self.clips):
                 clip_item["id"] = i
@@ -178,6 +203,94 @@ class AudioClipManager:
             clear_clip_index_cache()
             return True
         return False
+
+    def delete_clips_by_video_source(self, source_id: str) -> int:
+        """删除同一来源视频的所有片段，并清理对应视频资源"""
+        if not source_id:
+            return 0
+
+        indices = [
+            i
+            for i, clip in enumerate(self.clips)
+            if (clip.get("metadata", {}) or {}).get("video_source_id") == source_id
+        ]
+        if not indices:
+            return 0
+
+        source_paths = set()
+        source_audio_paths = set()
+
+        for i in reversed(indices):
+            clip = self.clips.pop(i)
+            try:
+                if os.path.exists(clip["filepath"]):
+                    os.remove(clip["filepath"])
+                    print(f"已删除音频文件: {clip['filepath']}")
+            except Exception as exc:
+                print(f"删除音频文件时出错 {clip['filepath']}: {exc}")
+
+            metadata = clip.get("metadata", {}) or {}
+            video_path = metadata.get("video_path")
+            if video_path:
+                try:
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                        print(f"已删除视频片段: {video_path}")
+                except Exception as exc:
+                    print(f"删除视频片段时出错 {video_path}: {exc}")
+
+            source_path = metadata.get("video_source")
+            if source_path:
+                source_paths.add(source_path)
+
+            source_audio_path = metadata.get("video_audio_path")
+            if source_audio_path:
+                source_audio_paths.add(source_audio_path)
+
+        for i, clip_item in enumerate(self.clips):
+            clip_item["id"] = i
+
+        self.save_clips()
+        clear_clip_index_cache()
+
+        for path in source_paths:
+            self._remove_video_source_assets(source_id, source_path=path)
+
+        for path in source_audio_paths:
+            self._remove_video_source_assets(source_id, audio_path=path)
+
+        if not source_paths and not source_audio_paths:
+            self._remove_video_source_assets(source_id)
+
+        return len(indices)
+
+    def _remove_video_source_assets(
+        self, source_id: str, source_path: Optional[str] = None, audio_path: Optional[str] = None
+    ) -> None:
+        if source_path:
+            try:
+                if os.path.exists(source_path):
+                    os.remove(source_path)
+                    print(f"已删除来源视频: {source_path}")
+            except Exception as exc:
+                print(f"删除来源视频时出错 {source_path}: {exc}")
+
+        if audio_path:
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+                    print(f"已删除来源音频: {audio_path}")
+            except Exception as exc:
+                print(f"删除来源音频时出错 {audio_path}: {exc}")
+
+        if source_id:
+            source_dir = os.path.join(self.config.video_clip_dir, source_id)
+            if os.path.exists(source_dir):
+                try:
+                    shutil.rmtree(source_dir)
+                    print(f"已删除来源视频片段目录: {source_dir}")
+                except Exception as exc:
+                    print(f"删除来源视频片段目录时出错 {source_dir}: {exc}")
 
     def cleanup_orphaned_files(self):
         """清理没有对应记录的音频文件"""

@@ -5,7 +5,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 
-from .audio_processing import apply_fade
+from .audio_processing import apply_fade, pitch_shift
 from .context import require_clip_manager
 from .music_generation import (
     auto_generate_music_from_score,
@@ -19,14 +19,10 @@ from .visualization import create_enhanced_analysis, create_spectrogram
 from .video_processing import process_video_to_clips
 
 
-def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
-    """处理音频上传"""
-    clip_manager = require_clip_manager()
-
+def _load_audio_input(audio_input):
     if audio_input is None:
-        return "请先上传音频文件", None, None, None
+        raise ValueError("请先上传音频文件")
 
-    # 读取音频
     if isinstance(audio_input, tuple):
         sr, y = audio_input
         y = np.array(y, dtype=np.float32)
@@ -37,7 +33,22 @@ def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
         if y.ndim > 1:
             y = np.mean(y, axis=1)
     else:
-        return "不支持的音频格式", None, None, None
+        raise ValueError("不支持的音频格式")
+
+    return np.asarray(y, dtype=np.float32), int(sr)
+
+
+def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
+    """处理音频上传"""
+    clip_manager = require_clip_manager()
+
+    if audio_input is None:
+        return "请先上传音频文件", None, None, None
+
+    try:
+        y, sr = _load_audio_input(audio_input)
+    except ValueError as exc:
+        return str(exc), None, None, None
 
     # 检测音高
     note_info = detect_pitch_advanced(y, sr)
@@ -98,7 +109,55 @@ def handle_audio_upload(audio_input, target_note, auto_detect, analysis_mode):
     return "\n".join(message), clip_info["id"], fig, fig2
 
 
-def handle_video_upload(video_input, auto_segment):
+def preview_pitch_shift(audio_input, semitones, shift_mode, preserve_attack_ms):
+    """试听不同变调策略的效果"""
+    if audio_input is None:
+        return "请先上传音频文件", None, None, None, None
+
+    try:
+        y, sr = _load_audio_input(audio_input)
+    except ValueError as exc:
+        return str(exc), None, None, None, None
+
+    note_before = detect_pitch_advanced(y, sr)
+    y_shifted = pitch_shift(
+        y,
+        sr,
+        float(semitones),
+        mode=shift_mode,
+        preserve_attack_ms=float(preserve_attack_ms),
+    )
+    y_shifted = apply_fade(y_shifted, sr, fade_in=0.005, fade_out=0.02)
+    note_after = detect_pitch_advanced(y_shifted, sr)
+
+    status = [
+        f"模式: **{shift_mode}**",
+        f"变调: **{float(semitones):+.1f} 半音**",
+        (
+            f"原始音高: **{note_before['note']}** ({note_before['frequency']:.1f} Hz)"
+            if note_before.get("frequency")
+            else "原始音高: **未检测到**"
+        ),
+        (
+            f"变调后: **{note_after['note']}** ({note_after['frequency']:.1f} Hz)"
+            if note_after.get("frequency")
+            else "变调后: **未检测到**"
+        ),
+    ]
+
+    if shift_mode == "preserve_attack":
+        status.append(f"保留字头: **{float(preserve_attack_ms):.0f} ms**")
+
+    return (
+        "\n".join(status),
+        (sr, y),
+        (sr, y_shifted),
+        create_spectrogram(y, sr, note_before.get("frequency")),
+        create_spectrogram(y_shifted, sr, note_after.get("frequency")),
+    )
+
+
+def handle_video_upload(video_input, auto_segment, segment_mode):
     """处理视频上传并自动切片"""
     clip_manager = require_clip_manager()
 
@@ -106,12 +165,18 @@ def handle_video_upload(video_input, auto_segment):
         return "请先上传视频文件", []
 
     try:
-        result = process_video_to_clips(video_input, auto_segment=auto_segment)
+        result = process_video_to_clips(
+            video_input,
+            auto_segment=auto_segment,
+            segment_mode=segment_mode,
+        )
     except Exception as exc:
         return f"视频处理失败: {str(exc)}", []
 
     segments = result.get("segments", [])
     reason = result.get("reason")
+    resolved_mode = result.get("segment_mode_resolved", segment_mode)
+    diagnostics = result.get("segment_diagnostics") or {}
     if not segments:
         return "未能从视频中提取片段", []
 
@@ -128,6 +193,7 @@ def handle_video_upload(video_input, auto_segment):
                 "video_source": str(video_input),
                 "video_source_id": source_id,
                 "video_source_name": source_name,
+                "video_audio_path": result.get("audio_path", ""),
                 "video_path": seg.get("video_path", ""),
                 "video_start": seg.get("start", 0.0),
                 "video_end": seg.get("end", 0.0),
@@ -146,7 +212,20 @@ def handle_video_upload(video_input, auto_segment):
             ]
         )
 
-    message = [f"✅ 已生成 {len(table_data)} 个音频片段"]
+    message = [
+        f"✅ 已生成 {len(table_data)} 个音频片段",
+        f"切分模式: **{resolved_mode}**",
+    ]
+    if diagnostics:
+        avg_duration = diagnostics.get("avg_duration", 0.0)
+        message.append(f"平均片段时长: **{avg_duration:.2f} 秒**")
+        if "voiced_ratio" in diagnostics:
+            message.append(
+                "诊断: "
+                f"voiced={diagnostics.get('voiced_ratio', 0.0):.2f}, "
+                f"percussive={diagnostics.get('percussive_ratio', 0.0):.2f}, "
+                f"onset_density={diagnostics.get('onset_density', 0.0):.2f}/s"
+            )
     if reason:
         message.append(f"⚠️ 自动切割提示: {reason}")
 
@@ -440,6 +519,12 @@ def build_advanced_ui():
                     with gr.Column(scale=1):
                         video_input = gr.Video(label="上传视频文件", format="mp4")
                         auto_segment = gr.Checkbox(label="自动切割", value=True)
+                        segment_mode = gr.Radio(
+                            choices=["auto", "percussive", "sustained", "vocal"],
+                            label="切分模式",
+                            value="auto",
+                            info="auto 会自动判断是打击型、持续音还是人声",
+                        )
                         btn_video_process = gr.Button("处理视频", variant="primary")
 
                     with gr.Column(scale=2):
@@ -454,7 +539,7 @@ def build_advanced_ui():
 
                 btn_video_process.click(
                     fn=handle_video_upload,
-                    inputs=[video_input, auto_segment],
+                    inputs=[video_input, auto_segment, segment_mode],
                     outputs=[video_result, video_clips_table],
                 )
             with gr.TabItem("🎙️ 音频上传与识别"):
@@ -575,6 +660,72 @@ def build_advanced_ui():
                     outputs=[process_result, audio_preview],
                 )
 
+            with gr.TabItem("🧪 变调测试"):
+                gr.Markdown(
+                    """
+                上传一个单字或单音，直接试听两种变调策略。
+                `preserve_attack` 会保留前段字头，通常更适合鬼畜切字。
+                """
+                )
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        pitch_test_input = gr.Audio(label="测试音频", type="filepath")
+                        pitch_test_steps = gr.Slider(
+                            label="变调半音",
+                            minimum=-12,
+                            maximum=12,
+                            value=0,
+                            step=0.5,
+                        )
+                        pitch_test_mode = gr.Radio(
+                            choices=["standard", "preserve_attack"],
+                            value="preserve_attack",
+                            label="变调策略",
+                        )
+                        preserve_attack_ms = gr.Slider(
+                            label="保留字头时长 (ms)",
+                            minimum=0,
+                            maximum=120,
+                            value=35,
+                            step=5,
+                        )
+                        btn_pitch_test = gr.Button("生成试听", variant="primary")
+                        pitch_test_status = gr.Markdown("等待测试...", label="测试结果")
+
+                    with gr.Column(scale=2):
+                        pitch_test_original = gr.Audio(label="原始音频", type="numpy")
+                        pitch_test_processed = gr.Audio(label="变调后音频", type="numpy")
+                        with gr.Row():
+                            pitch_test_original_plot = gr.Plot(label="原始频谱")
+                            pitch_test_processed_plot = gr.Plot(label="变调后频谱")
+
+                def toggle_preserve_attack(shift_mode):
+                    return gr.Slider(visible=shift_mode == "preserve_attack")
+
+                pitch_test_mode.change(
+                    fn=toggle_preserve_attack,
+                    inputs=[pitch_test_mode],
+                    outputs=[preserve_attack_ms],
+                )
+
+                btn_pitch_test.click(
+                    fn=preview_pitch_shift,
+                    inputs=[
+                        pitch_test_input,
+                        pitch_test_steps,
+                        pitch_test_mode,
+                        preserve_attack_ms,
+                    ],
+                    outputs=[
+                        pitch_test_status,
+                        pitch_test_original,
+                        pitch_test_processed,
+                        pitch_test_original_plot,
+                        pitch_test_processed_plot,
+                    ],
+                )
+
             with gr.TabItem("🎵 音乐制作"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -624,7 +775,21 @@ def build_advanced_ui():
             with gr.TabItem("📁 片段管理"):
                 clip_manager = require_clip_manager()
 
+                def _normalize_selected_id(clip_id):
+                    clips = clip_manager.get_all_clips()
+                    if not clips:
+                        return 0
+                    ids = [clip["id"] for clip in clips]
+                    try:
+                        clip_id = int(clip_id)
+                    except Exception:
+                        return ids[0]
+                    if clip_id in ids:
+                        return clip_id
+                    return min(ids, key=lambda x: abs(x - clip_id))
+
                 def update_clips_table(selected_id=None):
+                    selected_id = _normalize_selected_id(selected_id)
                     clips = clip_manager.get_all_clips()
                     table_data = []
                     for clip in clips:
@@ -691,6 +856,7 @@ def build_advanced_ui():
                     btn_refresh = gr.Button("刷新列表")
                     selected_clip_id = gr.Number(label="选中片段ID", value=0, precision=0)
                     btn_delete = gr.Button("删除片段", variant="stop")
+                    btn_delete_source = gr.Button("删除来源视频所有片段", variant="stop")
 
                 with gr.Row():
                     btn_preview = gr.Button("预览片段音频", variant="primary")
@@ -702,24 +868,98 @@ def build_advanced_ui():
 
                 def cleanup_orphaned(selected_id):
                     clip_manager.cleanup_orphaned_files()
-                    return "已清理孤立文件", update_clips_table(selected_id)
+                    selected_id = _normalize_selected_id(selected_id)
+                    return "已清理孤立文件", update_clips_table(selected_id), selected_id, selected_id
 
                 btn_cleanup.click(
-                    fn=cleanup_orphaned, inputs=[selected_state], outputs=[compose_result, clips_table]
+                    fn=cleanup_orphaned,
+                    inputs=[selected_state],
+                    outputs=[compose_result, clips_table, selected_clip_id, selected_state],
                 )
 
                 def delete_selected_clip(clip_id):
                     success = clip_manager.delete_clip(int(clip_id))
+                    selected_id = _normalize_selected_id(clip_id)
                     if success:
-                        return f"✅ 已删除片段 {clip_id}", update_clips_table(clip_id)
-                    return f"❌ 删除失败，片段 {clip_id} 不存在", update_clips_table(clip_id)
+                        return (
+                            f"✅ 已删除片段 {clip_id}",
+                            update_clips_table(selected_id),
+                            selected_id,
+                            selected_id,
+                        )
+                    return (
+                        f"❌ 删除失败，片段 {clip_id} 不存在",
+                        update_clips_table(selected_id),
+                        selected_id,
+                        selected_id,
+                    )
+
+                def refresh_clips(selected_id):
+                    selected_id = _normalize_selected_id(selected_id)
+                    return update_clips_table(selected_id), selected_id, selected_id
 
                 btn_refresh.click(
-                    fn=update_clips_table, inputs=[selected_state], outputs=[clips_table]
+                    fn=refresh_clips,
+                    inputs=[selected_state],
+                    outputs=[clips_table, selected_clip_id, selected_state],
                 )
 
                 btn_delete.click(
-                    fn=delete_selected_clip, inputs=[selected_clip_id], outputs=[compose_result, clips_table]
+                    fn=delete_selected_clip,
+                    inputs=[selected_clip_id],
+                    outputs=[compose_result, clips_table, selected_clip_id, selected_state],
+                )
+
+                def delete_source_clips(clip_id):
+                    try:
+                        clip_id = int(clip_id)
+                    except Exception:
+                        return (
+                            "? 无效的片段ID",
+                            update_clips_table(None),
+                            0,
+                            0,
+                        )
+                    if not 0 <= clip_id < len(clip_manager.clips):
+                        return (
+                            "? 无效的片段ID",
+                            update_clips_table(None),
+                            0,
+                            0,
+                        )
+
+                    clip = clip_manager.clips[clip_id]
+                    metadata = clip.get("metadata", {}) or {}
+                    source_id = metadata.get("video_source_id")
+                    if not source_id:
+                        selected_id = _normalize_selected_id(clip_id)
+                        return (
+                            "? 该片段没有来源视频",
+                            update_clips_table(selected_id),
+                            selected_id,
+                            selected_id,
+                        )
+
+                    deleted_count = clip_manager.delete_clips_by_video_source(source_id)
+                    selected_id = _normalize_selected_id(clip_id)
+                    if deleted_count > 0:
+                        return (
+                            f"? 已删除来源 {source_id} 的 {deleted_count} 个片段",
+                            update_clips_table(selected_id),
+                            selected_id,
+                            selected_id,
+                        )
+                    return (
+                        f"? 未找到来源 {source_id} 的片段",
+                        update_clips_table(selected_id),
+                        selected_id,
+                        selected_id,
+                    )
+
+                btn_delete_source.click(
+                    fn=delete_source_clips,
+                    inputs=[selected_clip_id],
+                    outputs=[compose_result, clips_table, selected_clip_id, selected_state],
                 )
 
                 def preview_selected_clip(clip_id):
@@ -748,9 +988,9 @@ def build_advanced_ui():
 
                 def select_id(clip_id):
                     if clip_id is None:
-                        return update_clips_table(None), 0
-                    clip_id = int(clip_id)
-                    return update_clips_table(clip_id), clip_id
+                        return update_clips_table(None), 0, 0
+                    clip_id = _normalize_selected_id(clip_id)
+                    return update_clips_table(clip_id), clip_id, clip_id
 
                 clips_table.select(
                     fn=select_row,
@@ -759,7 +999,9 @@ def build_advanced_ui():
                 )
 
                 selected_clip_id.change(
-                    fn=select_id, inputs=[selected_clip_id], outputs=[clips_table, selected_state]
+                    fn=select_id,
+                    inputs=[selected_clip_id],
+                    outputs=[clips_table, selected_state, selected_clip_id],
                 )
 
             build_music_composition_tab()
@@ -803,9 +1045,3 @@ def build_advanced_ui():
         )
 
     return demo
-
-
-
-
-
-
