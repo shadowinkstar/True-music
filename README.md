@@ -83,6 +83,43 @@ TROUBLESHOOTING
 - Mismatched timing: ensure your score is clean and the tempo is correct.
 
 
+BRANCH WORKFLOW
+---------------
+- `dev` is the daily integration branch. Treat it as the branch that should always contain the latest usable combined work.
+- Local feature work should branch from `dev`, then merge back into `dev`.
+- Codex-generated branches should also be merged back into `dev` after review or verification.
+- `main` stays for relatively stable milestones. Promote changes from `dev` to `main` only when the result is ready.
+
+Recommended flow:
+
+```bash
+git switch dev
+git pull origin dev
+
+# start work
+git switch -c feature/your-change
+
+# after finishing
+git switch dev
+git merge feature/your-change
+git push origin dev
+```
+
+For Codex branches:
+
+```bash
+git switch dev
+git pull origin dev
+git merge origin/codex/<branch-name>
+git push origin dev
+```
+
+Current project convention:
+- `dev` is the source of truth for active development.
+- Both local changes and future Codex changes should end up on `dev`.
+- `main` is updated from `dev`, not the other way around, unless there is a deliberate hotfix.
+
+
 LICENSE
 -------
 Add your preferred license here.
