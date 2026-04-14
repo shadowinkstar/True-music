@@ -1,5 +1,4 @@
 import json
-
 from .clip_manager import AudioClipManager
 from .context import get_config, set_clip_manager
 from .fonts import setup_chinese_fonts

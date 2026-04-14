@@ -185,6 +185,8 @@ def auto_generate_music_from_score(
     use_pitch_shift=True,
     source_sequence_text="",
     allowed_video_sources_text="",
+    lead_track_gain=1.0,
+    backing_track_gain=1.0,
     generate_video=False,
 ):
     """
@@ -230,7 +232,14 @@ def auto_generate_music_from_score(
         video_default_info = None
         mix_analysis = _analyze_track_mix(notes)
         lead_track = int(mix_analysis["lead_track"])
-        track_gain_map = mix_analysis["gain_map"]
+        track_gain_map = dict(mix_analysis["gain_map"])
+        lead_track_gain = float(lead_track_gain)
+        backing_track_gain = float(backing_track_gain)
+        for track_num, gain in list(track_gain_map.items()):
+            if int(track_num) == lead_track:
+                track_gain_map[track_num] = float(np.clip(gain * lead_track_gain, 0.0, 2.0))
+            else:
+                track_gain_map[track_num] = float(np.clip(gain * backing_track_gain, 0.0, 2.0))
         source_sequence = _parse_source_sequence(source_sequence_text)
         allowed_video_sources = _parse_source_sequence(allowed_video_sources_text)
         sequence_index = 0
@@ -634,6 +643,8 @@ def auto_generate_music_from_score(
         - **生成的片段**: {len(audio_segments)} 个
         - **成功放置**: {placed_count} 个片段
         - **峰值电平**: {np.max(np.abs(final_audio)):.3f}
+        - **主音轨音量系数**: {lead_track_gain:.2f}
+        - **其他音轨音量系数**: {backing_track_gain:.2f}
 
         ### 使用片段
         """

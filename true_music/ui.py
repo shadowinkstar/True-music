@@ -25,15 +25,25 @@ def _load_audio_input(audio_input):
 
     if isinstance(audio_input, tuple):
         sr, y = audio_input
-        y = np.array(y, dtype=np.float32)
+        y = np.asarray(y)
     elif isinstance(audio_input, dict):
-        sr, y = audio_input["sample_rate"], np.array(audio_input["data"], dtype=np.float32)
+        sr, y = audio_input["sample_rate"], np.asarray(audio_input["data"])
     elif isinstance(audio_input, str):
         y, sr = sf.read(audio_input)
-        if y.ndim > 1:
-            y = np.mean(y, axis=1)
     else:
         raise ValueError("不支持的音频格式")
+
+    if y.ndim > 1:
+        y = np.mean(y, axis=1)
+
+    if np.issubdtype(y.dtype, np.integer):
+        max_val = max(abs(np.iinfo(y.dtype).min), np.iinfo(y.dtype).max)
+        y = y.astype(np.float32) / float(max_val)
+    else:
+        y = y.astype(np.float32)
+        peak = np.max(np.abs(y)) if y.size else 0.0
+        if peak > 1.0:
+            y = y / peak
 
     return np.asarray(y, dtype=np.float32), int(sr)
 
@@ -155,6 +165,45 @@ def preview_pitch_shift(audio_input, semitones, shift_mode, preserve_attack_ms):
         create_spectrogram(y, sr, note_before.get("frequency")),
         create_spectrogram(y_shifted, sr, note_after.get("frequency")),
     )
+
+
+def save_test_audio_clip(audio_input):
+    """将测试音频保存为切片，便于后续管理和编排。"""
+    clip_manager = require_clip_manager()
+
+    if audio_input is None:
+        return "请先录制或上传测试音频", None
+
+    try:
+        y, sr = _load_audio_input(audio_input)
+    except ValueError as exc:
+        return str(exc), None
+
+    note_info = detect_pitch_advanced(y, sr)
+    metadata = {
+        "upload_time": str(time.strftime("%Y-%m-%d %H:%M:%S")),
+        "source": "pitch_test",
+        "target_note": "",
+    }
+    if isinstance(audio_input, str):
+        metadata["original_name"] = os.path.basename(audio_input)
+
+    clip_info = clip_manager.add_clip(
+        y,
+        sr,
+        note_info=convert_to_serializable(note_info) if note_info else None,
+        metadata=metadata,
+    )
+
+    if note_info.get("frequency"):
+        status = (
+            f"✅ 已保存测试音频为片段 {clip_info['id']}，"
+            f"检测音高 **{note_info.get('note')}** ({note_info.get('frequency'):.1f} Hz)"
+        )
+    else:
+        status = f"✅ 已保存测试音频为片段 {clip_info['id']}"
+
+    return status, clip_info["id"]
 
 
 def handle_video_upload(video_input, auto_segment, segment_mode):
@@ -365,6 +414,24 @@ def build_music_composition_tab():
                     step=5,
                 )
 
+                with gr.Row():
+                    lead_track_gain = gr.Slider(
+                        label="主音轨音量",
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.05,
+                        info="提高主旋律/主声部的混音音量",
+                    )
+                    backing_track_gain = gr.Slider(
+                        label="其他音轨音量",
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.05,
+                        info="压低或增强伴奏/和声音轨",
+                    )
+
                 # 生成按钮
                 btn_generate = gr.Button("🎵 自动生成音乐", variant="primary", size="lg")
                 generation_status = gr.Markdown("准备生成...", label="生成状态")
@@ -412,6 +479,8 @@ def build_music_composition_tab():
             use_pitch_shift,
             source_sequence_text,
             selected_sources,
+            lead_gain,
+            backing_gain,
             generate_video,
         ):
             allowed_sources_text = _parse_selected_sources(selected_sources)
@@ -422,6 +491,8 @@ def build_music_composition_tab():
                 use_pitch_shift,
                 source_sequence_text,
                 allowed_sources_text,
+                lead_gain,
+                backing_gain,
                 generate_video,
             )
 
@@ -434,6 +505,8 @@ def build_music_composition_tab():
                 use_pitch_shift,
                 source_sequence,
                 video_sources,
+                lead_track_gain,
+                backing_track_gain,
                 generate_video,
             ],
             outputs=[
@@ -545,7 +618,12 @@ def build_advanced_ui():
             with gr.TabItem("🎙️ 音频上传与识别"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        audio_input = gr.Audio(label="上传音频文件", type="filepath")
+                        audio_input = gr.Audio(
+                            label="上传音频文件",
+                            sources=["upload"],
+                            type="filepath",
+                            format="wav",
+                        )
                         target_note = gr.Textbox(
                             label="目标音高（可选）",
                             placeholder="例如：C4, D#4, Gb5",
@@ -670,7 +748,12 @@ def build_advanced_ui():
 
                 with gr.Row():
                     with gr.Column(scale=1):
-                        pitch_test_input = gr.Audio(label="测试音频", type="filepath")
+                        pitch_test_input = gr.Audio(
+                            label="测试音频",
+                            sources=["upload", "microphone"],
+                            type="filepath",
+                            recording=True,
+                        )
                         pitch_test_steps = gr.Slider(
                             label="变调半音",
                             minimum=-12,
@@ -690,7 +773,9 @@ def build_advanced_ui():
                             value=35,
                             step=5,
                         )
-                        btn_pitch_test = gr.Button("生成试听", variant="primary")
+                        with gr.Row():
+                            btn_pitch_test = gr.Button("生成试听", variant="primary")
+                            btn_save_test_clip = gr.Button("保存为切片", variant="secondary")
                         pitch_test_status = gr.Markdown("等待测试...", label="测试结果")
 
                     with gr.Column(scale=2):
@@ -866,6 +951,14 @@ def build_advanced_ui():
                     btn_cleanup = gr.Button("清理孤立文件", variant="secondary")
                     selected_state = gr.State(0)
 
+                def save_test_clip_and_refresh(audio_input):
+                    status, clip_id = save_test_audio_clip(audio_input)
+                    if clip_id is None:
+                        selected_id = _normalize_selected_id(0)
+                        return status, update_clips_table(selected_id), selected_id, selected_id
+                    selected_id = _normalize_selected_id(clip_id)
+                    return status, update_clips_table(selected_id), selected_id, selected_id
+
                 def cleanup_orphaned(selected_id):
                     clip_manager.cleanup_orphaned_files()
                     selected_id = _normalize_selected_id(selected_id)
@@ -875,6 +968,12 @@ def build_advanced_ui():
                     fn=cleanup_orphaned,
                     inputs=[selected_state],
                     outputs=[compose_result, clips_table, selected_clip_id, selected_state],
+                )
+
+                btn_save_test_clip.click(
+                    fn=save_test_clip_and_refresh,
+                    inputs=[pitch_test_input],
+                    outputs=[pitch_test_status, clips_table, selected_clip_id, selected_state],
                 )
 
                 def delete_selected_clip(clip_id):
